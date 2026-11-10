@@ -3373,19 +3373,28 @@ public static class CliApplication
 	}
 
 	/// <summary>第一个"有名字"的栈帧（形如 <c> @ SourceMaterialConverter.BuildOpacityMask</c>）。</summary>
+	/// <remarks>
+	/// 只给一帧是为了让报告读起来像一句话，但查问题时往往不够：实测
+	/// <c>IndexOutOfRangeException</c> 的第一帧永远落在 <c>ThrowHelpers.ThrowIndexOutOfRangeException</c>，
+	/// 真正出事的数组下标在哪一层完全看不见。所以 <c>HD2MOD_DEBUG=1</c> 时把前几帧一起给出来，
+	/// 默认行为不变。
+	/// </remarks>
 	private static string FirstFrame(Exception exception)
 	{
 		var frames = new System.Diagnostics.StackTrace(exception, fNeedFileInfo: false).GetFrames();
+		var detailed = Environment.GetEnvironmentVariable("HD2MOD_DEBUG") is { Length: > 0 };
+		var names = new List<string>();
 		foreach (var frame in frames ?? [])
 		{
 			var method = frame.GetMethod();
 			if (method?.DeclaringType is not { } declaring) continue;
 			// 跳过本方法自己与聚合包装，留下真正出事的那一层。
 			if (method.Name is "DescribeFailure" or "FirstFrame" or "Invoke" or "MoveNext") continue;
-			return $" @ {declaring.Name}.{method.Name}";
+			names.Add($"{declaring.Name}.{method.Name}");
+			if (!detailed || names.Count >= 6) break;
 		}
 
-		return string.Empty;
+		return names.Count == 0 ? string.Empty : " @ " + string.Join(" ← ", names);
 	}
 
 	/// <summary>
