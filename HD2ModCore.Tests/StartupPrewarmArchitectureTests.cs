@@ -47,6 +47,22 @@ public sealed class StartupPrewarmArchitectureTests
 		Assert.Contains("预热运行时护甲注册失败", page);
 	}
 
+	// 预热可能跑在资产索引重建**之前**（实测：应用 09:43 启动、索引 09:46 才建好）。
+	// 那一次读到 0 条会把"已加载"标记锁死，之后打开页面只刷新运行时状态，
+	// 护甲目录再也进不来——页面永远显示「护甲目录是空的」，而索引明明是好的。
+	[Fact]
+	public void ArmorPageReloadsItsCatalogWhenPrewarmFoundItEmpty()
+	{
+		var root = FindRepositoryRoot();
+		var page = File.ReadAllText(Path.Combine(root, "HD2ModManager", "ViewModels", "ArmorRegistryPageViewModel.cs"));
+
+		// 空目录必须走完整重载，而不是只刷运行时状态。
+		Assert.Contains("hasLoadedCatalog && cachedCatalog.Count > 0", page);
+		Assert.Contains(": EnsureCatalogLoadedAsync(isWarmUp: false);", page);
+		// 反向断言：以前那句"只看 hasLoadedCatalog"就是这次要修的病根。
+		Assert.DoesNotContain("hasLoadedCatalog ? RefreshRuntimeStatusAsync()", page);
+	}
+
 	[Fact]
 	public void StartupPrewarmWarmsTheArmorPageViewModelAndItsFacts()
 	{

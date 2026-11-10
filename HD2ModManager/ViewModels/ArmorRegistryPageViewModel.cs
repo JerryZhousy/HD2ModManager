@@ -401,7 +401,15 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 
 	// 页面首次打开：目录、快照与覆盖事实都还没有，走一次完整加载。
 	// 加载是单飞的（见 EnsureCatalogLoadedAsync），所以它与启动预热**共用同一次**。
-	public Task InitializeAsync() => hasLoadedCatalog ? RefreshRuntimeStatusAsync() : EnsureCatalogLoadedAsync(isWarmUp: false);
+	//
+	// **空目录也要重来一次。** 启动预热可能跑在资产索引重建之前（实测：应用 09:43 启动、
+	// 索引 09:46 才建好），那一次读到 0 条会把 hasLoadedCatalog 锁死；之后打开页面只走
+	// RefreshRuntimeStatusAsync（只刷运行时状态），299 条护甲再也进不来，页面永远显示
+	// 「护甲目录是空的」。空目录只可能是"索引还没就绪"，重读一次才是对的。
+	public Task InitializeAsync()
+		=> hasLoadedCatalog && cachedCatalog.Count > 0
+			? RefreshRuntimeStatusAsync()
+			: EnsureCatalogLoadedAsync(isWarmUp: false);
 
 	// 启动预热：在用户还没点开护甲页时，先把目录、快照与最贵的覆盖事实算好。
 	// 谁先到谁发起，后来者等同一个 Task——预热与首开不会各读一遍，
