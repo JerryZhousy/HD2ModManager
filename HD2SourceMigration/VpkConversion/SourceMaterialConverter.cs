@@ -3167,6 +3167,16 @@ public sealed class SourceMaterialConverter
 			}
 		}
 
+		// 编码前必须确认像素数量与声明的尺寸一致。
+		// 少了就会在 BC7 编码里按 w×h 取块，越界抛 IndexOutOfRangeException —— 而那条栈
+		// 只会说"数组越界"，指不到是哪张图（实测 Ramune 的整合材质包就是这么整包失败的）。
+		if (rgba.Length < checked(vtf.Width * vtf.Height * 4))
+		{
+			throw new InvalidDataException(
+				$"底色像素不足：{loaded.Stem} 声明 {vtf.Width}×{vtf.Height}（需要 {checked(vtf.Width * vtf.Height * 4)} 字节），"
+				+ $"实际 {rgba.Length} 字节。多半是底图 VTF 的 mip0 尺寸与头部不一致。");
+		}
+
 		var bc7 = EncodeBc7Deduplicated(rgba, vtf.Width, vtf.Height, srgb: true);
 
 		var texture = new Hd2TextureAsset();
@@ -3675,6 +3685,20 @@ public sealed class SourceMaterialConverter
 				}
 
 				break;
+			case 5:    // I8 -> 灰度（亮度图，没有 alpha，补 255）
+				// 实测 `eye_self`（眼睛自发光遮罩）就是 I8：以前这里没有分支，
+				// 解码直接抛"不在已实现的非压缩拆包列表里"，于是整包材质转换失败 ——
+				// 而失败又被下游当成"读到空像素"，最终表现为脸部在游戏里是品红。
+				Require(source, pixels, vtf.FormatName);
+				for (var i = 0; i < pixels; i++)
+				{
+					output[(i * 4) + 0] = source[i];
+					output[(i * 4) + 1] = source[i];
+					output[(i * 4) + 2] = source[i];
+					output[(i * 4) + 3] = 255;
+				}
+
+				break;
 			case 6:    // IA88 -> 灰度 + alpha
 				Require(source, pixels * 2, vtf.FormatName);
 				for (var i = 0; i < pixels; i++)
@@ -3735,6 +3759,13 @@ public sealed class SourceMaterialConverter
 		}
 		catch (Exception exception) when (IsTextureReadFailure(exception))
 		{
+			// **失败时尺寸必须一起归零。** 曾经只返回 false，width/height 停在"读头部时的值"
+			// （比如 1024×1024），而 rgba 是空数组；调用方只看 `rgba is not null` 就按 1024×1024
+			// 去取下标 —— 空数组 → IndexOutOfRangeException，整包材质转换失败，
+			// 而报告里只有一句"数组越界"，查不到是哪张图（实测 Ramune 的眼睛自发光遮罩）。
+			rgba = [];
+			width = 0;
+			height = 0;
 			return false;
 		}
 	}
