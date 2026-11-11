@@ -496,6 +496,330 @@ do
 
 	Runtime.uninstall()
 end
+
+-- ---------------------------------------------------------------------------
+print("T8 会话死亡后的停写窗口（多人局换场景不再把骨写到已释放对象上）")
+do
+	rawset(_G, "render", function() end)
+
+	local t8Avatar = newUnit("t8avatar", AVATAR_NODES, true, "#ID[t8avatar]")
+	do
+		local mgId = S.Application.string_to_id32("support_mg")
+		t8Avatar.ids[mgId] = true
+		t8Avatar.nodeOf[mgId] = 5
+	end
+	local t8Armors = {}
+	for index, count in ipairs(ARMOR_NODES) do
+		t8Armors[index] = newUnit("t8a" .. index, count, false, "#ID[t8a" .. index .. "]")
+		dress(t8Armors[index])
+		engine.pos[t8Armors[index]] = { 0, 0, 0 }
+	end
+	avatar = t8Avatar
+	armors = t8Armors
+	engine.pos[t8Avatar] = { 0, 0, 0 }
+
+	local logPath8 = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t8death.txt"
+	pcall(os.remove, logPath8)
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+		logPath = logPath8,
+		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
+		pollFrames = 1, validateFrames = 0,   -- 关掉名单校验，隔离出"死亡停写"这一条
+		maxArmorDistance = 10.0,
+		deathGraceFrames = 20,
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T8 先全部挂上", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+
+	-- ① 正常帧确实在写骨（否则下面的"停写"断言是空转）
+	local baseline = engine.writes
+	for _ = 1, 5 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T8 正常帧会写骨", engine.writes > baseline,
+		string.format("写入=%d", engine.writes - baseline))
+
+	-- ② 停写窗口内**一个骨都不写**。直接设窗口，把"是谁设的"和"设了之后怎样"分开测。
+	local heldFrom = runtime.frame
+	runtime.driveHoldUntil = heldFrom + 20
+	local writesAtHold = engine.writes
+	for _ = 1, 15 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T8 窗口内不写骨", engine.writes == writesAtHold,
+		string.format("窗口内写入=%d", engine.writes - writesAtHold))
+	check("T8 窗口内确实过了帧", runtime.frame > heldFrom,
+		string.format("frame=%d→%d", heldFrom, runtime.frame))
+
+	-- ③ 过了窗口必须恢复写入：停写不等于永久停手
+	for _ = 1, 40 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T8 窗口过后恢复写骨", engine.writes > writesAtHold,
+		string.format("恢复后写入=%d", engine.writes - writesAtHold))
+
+	-- ④ 真让一个会话死掉：pruneSessions 必须自己把窗口设上。
+	--    这是"多人局换场景"的入口条件——单人局是整组一起死，走的是另一条分支。
+	local beforeDeath = runtime.frame
+	engine.alive[t8Armors[1]] = false
+	engine.time = engine.time + 1 / 120; probeRender()
+	check("T8 会话死亡会设置停写窗口", (runtime.driveHoldUntil or 0) > beforeDeath,
+		string.format("holdUntil=%s frame=%s",
+			tostring(runtime.driveHoldUntil), tostring(runtime.frame)))
+
+	Runtime.uninstall()
+end
+
+-- ---------------------------------------------------------------------------
+print("T9 加载空档：不逐条查存活，直接整组重挂")
+--
+-- 加载界面期间 render/update 不跑，而引擎正在销毁上一场景的 unit。
+-- 回来后的第一帧如果逐条 `Unit.alive`（session_health 内部就是它），
+-- 就是在"句柄可能已被释放"的窗口里发引擎调用 —— 2026-11-11 实机崩在 0x3e564b 读空指针。
+do
+	rawset(_G, "render", function() end)
+
+	local t9Avatar = newUnit("t9avatar", AVATAR_NODES, true, "#ID[t9avatar]")
+	do
+		local mgId = S.Application.string_to_id32("support_mg")
+		t9Avatar.ids[mgId] = true
+		t9Avatar.nodeOf[mgId] = 5
+	end
+	local t9Armors = {}
+	for index, count in ipairs(ARMOR_NODES) do
+		t9Armors[index] = newUnit("t9a" .. index, count, false, "#ID[t9a" .. index .. "]")
+		dress(t9Armors[index])
+		engine.pos[t9Armors[index]] = { 0, 0, 0 }
+	end
+	avatar = t9Avatar
+	armors = t9Armors
+	engine.pos[t9Avatar] = { 0, 0, 0 }
+
+	local logPath9 = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t9gap.txt"
+	pcall(os.remove, logPath9)
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+		logPath = logPath9,
+		settleFrames = 2, snapshot = false, tunePath = "nonexistent-hd2pbx-tune.txt",
+		pollFrames = 1, validateFrames = 0,
+		maxArmorDistance = 10.0,
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T9 先全部挂上", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+
+	-- 统计这一帧会发多少次 Unit.alive
+	local originalAlive = S.Unit.alive
+	local aliveCalls = 0
+	S.Unit.alive = function(unit) aliveCalls = aliveCalls + 1 return originalAlive(unit) end
+	engine.time = engine.time + 5.0          -- 模拟加载：时钟一次跳 5 秒
+	probeRender()
+	S.Unit.alive = originalAlive
+
+	check("T9 空档后整组重挂（会话清空）", runtime.sessions == nil,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+	check("T9 空档帧没有再查存活", aliveCalls == 0, "Unit.alive 调用=" .. tostring(aliveCalls))
+	local text9 = ""
+	do
+		local handle = io.open(logPath9, "r")
+		if handle then text9 = handle:read("*a") or ""; handle:close() end
+	end
+	check("T9 留下空档日志", text9:find("检测到加载空档", 1, true) ~= nil)
+	check("T9 崩场景那套「会话失效」没有出现", text9:find("会话失效", 1, true) == nil,
+		"不应逐条判活")
+
+	Runtime.uninstall()
+end
+
+-- ---------------------------------------------------------------------------
+print("T10 诊断开关 writeOff：只挂不写")
+--
+-- 用途：把"崩溃是否由写骨触发"与"仅仅持有句柄就够"分开。
+-- 这个开关**不能**影响别的行为：发现/挂载/调度/判活全都照旧，只是不写骨。
+do
+	rawset(_G, "render", function() end)
+
+	local t10Avatar = newUnit("t10avatar", AVATAR_NODES, true, "#ID[t10avatar]")
+	do
+		local mgId = S.Application.string_to_id32("support_mg")
+		t10Avatar.ids[mgId] = true
+		t10Avatar.nodeOf[mgId] = 5
+	end
+	local t10Armors = {}
+	for index, count in ipairs(ARMOR_NODES) do
+		t10Armors[index] = newUnit("t10a" .. index, count, false, "#ID[t10a" .. index .. "]")
+		dress(t10Armors[index])
+		engine.pos[t10Armors[index]] = { 0, 0, 0 }
+	end
+	avatar = t10Avatar
+	armors = t10Armors
+	engine.pos[t10Avatar] = { 0, 0, 0 }
+
+	local tunePath10 = (os.getenv("TEMP") or ".") .. "\\physbone-t10-writeoff-tune.txt"
+	do
+		local handle = io.open(tunePath10, "w")
+		handle:write("writeOff = 1\n")
+		handle:close()
+	end
+	local logPath10 = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t10writeoff.txt"
+	pcall(os.remove, logPath10)
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+		logPath = logPath10,
+		settleFrames = 2, snapshot = false, tunePath = tunePath10,
+		pollFrames = 1, validateFrames = 0,
+		maxArmorDistance = 10.0,
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T10 照样挂上（开关不影响挂载）",
+		runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+
+	local writesBefore = engine.writes
+	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T10 一帧都不写", engine.writes == writesBefore,
+		string.format("写入=%d", engine.writes - writesBefore))
+	check("T10 会话仍在（不是把会话丢了）",
+		runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES)
+
+	local text10 = ""
+	do
+		local handle = io.open(logPath10, "r")
+		if handle then text10 = handle:read("*a") or ""; handle:close() end
+	end
+	check("T10 明确说出生效", text10:find("writeOff=1", 1, true) ~= nil)
+	pcall(os.remove, tunePath10)
+
+	Runtime.uninstall()
+end
+
+-- ---------------------------------------------------------------------------
+print("T11 细分开关 discoverOnly / hardOff")
+--
+-- 实机已达成的结论：写骨不是触发点（writeOff=1 仍崩）。
+-- 于是继续往上游劈：① 只扫描不挂载；② 连扫描都不做。
+do
+	local function scenario(tag, tuneLine, expectLog)
+		rawset(_G, "render", function() end)
+		local av = newUnit(tag .. "avatar", AVATAR_NODES, true, "#ID[" .. tag .. "avatar]")
+		do
+			local mgId = S.Application.string_to_id32("support_mg")
+			av.ids[mgId] = true
+			av.nodeOf[mgId] = 5
+		end
+		local gear = {}
+		for index, count in ipairs(ARMOR_NODES) do
+			gear[index] = newUnit(tag .. "a" .. index, count, false, "#ID[" .. tag .. "a" .. index .. "]")
+			dress(gear[index])
+			engine.pos[gear[index]] = { 0, 0, 0 }
+		end
+		avatar = av
+		armors = gear
+		engine.pos[av] = { 0, 0, 0 }
+
+		local tunePath = (os.getenv("TEMP") or ".") .. "\\physbone-" .. tag .. "-tune.txt"
+		do
+			local handle = io.open(tunePath, "w")
+			handle:write(tuneLine .. "\n")
+			handle:close()
+		end
+		local logPath = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_" .. tag .. ".txt"
+		pcall(os.remove, logPath)
+
+		local runtime = Runtime.install(S, {
+			compat = Compat,
+			carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+			logPath = logPath,
+			settleFrames = 2, snapshot = false, tunePath = tunePath,
+			pollFrames = 1, validateFrames = 0,
+			maxArmorDistance = 10.0,
+		})
+		local probeRender = rawget(_G, "render")
+		for _ = 1, 90 do engine.time = engine.time + 1 / 120; probeRender() end
+
+		local text = ""
+		do
+			local handle = io.open(logPath, "r")
+			if handle then text = handle:read("*a") or ""; handle:close() end
+		end
+		check(tag .. " 不挂载（会话保持 nil）", runtime.sessions == nil,
+			string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+		check(tag .. " 说出生效", text:find(expectLog, 1, true) ~= nil)
+		pcall(os.remove, tunePath)
+		Runtime.uninstall()
+	end
+
+	scenario("discoverOnly", "discoverOnly = 1", "discoverOnly=1")
+	scenario("hardOff", "hardOff = 1", "hardOff=1")
+end
+
+-- ---------------------------------------------------------------------------
+print("T12 dropAllOnDeath：一见死亡就整组释放（不留句柄）")
+--
+-- 依据：discoverOnly（不持有句柄）不崩 ⇒ 崩因是攥着 unit 句柄跨过场景销毁。
+-- 默认行为是"只掉一部分就留着剩下的"（多人局不闪），但那批句柄正是悬空来源。
+do
+	rawset(_G, "render", function() end)
+
+	local t12Avatar = newUnit("t12avatar", AVATAR_NODES, true, "#ID[t12avatar]")
+	do
+		local mgId = S.Application.string_to_id32("support_mg")
+		t12Avatar.ids[mgId] = true
+		t12Avatar.nodeOf[mgId] = 5
+	end
+	local t12Armors = {}
+	for index, count in ipairs(ARMOR_NODES) do
+		t12Armors[index] = newUnit("t12a" .. index, count, false, "#ID[t12a" .. index .. "]")
+		dress(t12Armors[index])
+		engine.pos[t12Armors[index]] = { 0, 0, 0 }
+	end
+	avatar = t12Avatar
+	armors = t12Armors
+	engine.pos[t12Avatar] = { 0, 0, 0 }
+
+	local tunePath12 = (os.getenv("TEMP") or ".") .. "\\physbone-t12-dropall-tune.txt"
+	do
+		local handle = io.open(tunePath12, "w")
+		handle:write("dropAllOnDeath = 1\n")
+		handle:close()
+	end
+	local logPath12 = (os.getenv("LOCALAPPDATA") or ".") .. "\\hd2pbx_runtime_t12dropall.txt"
+	pcall(os.remove, logPath12)
+
+	local runtime = Runtime.install(S, {
+		compat = Compat,
+		carriers = { { rig = RIG, path = "fake.patch_1.gpu_resources" } },
+		logPath = logPath12,
+		settleFrames = 2, snapshot = false, tunePath = tunePath12,
+		pollFrames = 1, validateFrames = 0,
+		maxArmorDistance = 10.0,
+	})
+	local probeRender = rawget(_G, "render")
+	for _ = 1, 60 do engine.time = engine.time + 1 / 120; probeRender() end
+	check("T12 先全部挂上", runtime.sessions ~= nil and #runtime.sessions == #ARMOR_NODES,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+
+	-- 只死一个（多人局里队友那套先被释放）
+	engine.alive[t12Armors[1]] = false
+	engine.time = engine.time + 1 / 120; probeRender()
+
+	check("T12 一个死亡就整组释放（不留剩的）", runtime.sessions == nil,
+		string.format("会话=%s", tostring(runtime.sessions and #runtime.sessions)))
+	local text12 = ""
+	do
+		local handle = io.open(logPath12, "r")
+		if handle then text12 = handle:read("*a") or ""; handle:close() end
+	end
+	check("T12 日志说明整组释放", text12:find("整组释放", 1, true) ~= nil)
+	pcall(os.remove, tunePath12)
+
+	Runtime.uninstall()
+end
+
 print("")
 if failures == 0 then
 	print("=== 全部通过 ===")

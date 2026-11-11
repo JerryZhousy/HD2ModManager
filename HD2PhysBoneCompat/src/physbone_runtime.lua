@@ -63,11 +63,12 @@ local M = {}
 --
 -- 1.9.1：容器扫描窗口改成"按实际部署的最大 patch 序号 + 5"（以前写死 0..63，
 --        装一堆 mod 时排在 63 之后的物理 mod 会被漏掉，日志还误报成"没做 embed"）。
-M.VERSION = "2.1.12"
+M.VERSION = "2.1.23"
 
 --- 安装标记用的全局键。只写这一个全局，且值就是模块本身（便于外部检查是否已装）。
 local INSTALL_KEY = "__hd2physbone_runtime"
 
+local tune_values     -- 调参文件读数（定义在后面，tryAttach 也要用 ⇒ 必须先声明）
 local Compat          -- physbone_compat 模块（require 或注入）
 local S               -- stingray 命名空间
 local state = nil     -- 运行状态；nil = 未安装
@@ -582,6 +583,20 @@ local function tryAttach(runtime)
 	end
 	local armor = armorList[1]
 
+	-- 诊断开关（`discoverOnly = 1`）：只做发现，**不挂载、不持有任何 unit 句柄**。
+	-- 用途（2026-11-11）：已确认"写骨"不是触发点（writeOff=1 仍崩）。
+	-- 于是要把"扫描 unit"与"挂载并持有句柄"分开：
+	--   不崩 ⇒ 触发点是挂载/持有句柄；
+	--   还崩 ⇒ 连扫描都不能做（那就是更底层的事）。
+	if (tune_values(runtime).discoverOnly or 0) ~= 0 then
+		if not runtime.discoverOnlyLogged then
+			runtime.discoverOnlyLogged = true
+			runtime.logger("[physbone][诊断] discoverOnly=1 ⇒ 只扫描不挂载（找到 %d 个 avatar、%d 个护甲候选）",
+				#avatars, #armorList)
+		end
+		return false
+	end
+
 	local nodeCount = try(S.Unit.num_scene_graph_items, armor.unit)
 	if type(nodeCount) ~= "number" or nodeCount < 10 then
 		note_wait(runtime, "主件节点数异常", tostring(nodeCount))
@@ -809,11 +824,22 @@ local function pruneSessions(runtime)
 		end
 	end
 	runtime.sessions = kept
-	if dead > 0 or rebuilt > 0 then
+	local dropped = dead + rebuilt
+	if dropped > 0 then
 		runtime.logger("[physbone] 丢弃 %d 个已销毁 / %d 个已重建，剩 %d 个会话",
 			dead, rebuilt, #kept)
+		-- **死亡之后先停写一小段，等场景拆解落定。**
+		-- 场景拆解是**连续**发生的：一批 unit 死掉之后，同一场景里其余 unit 往往在接下来几帧
+		-- 继续被引擎释放。此时若继续驱动"刚才还活着"的会话，就会把骨写到已释放的对象上——
+		-- 表现为访问违例、崩在引擎内部，而 Lua 层 pcall 抓不到（2026-11-11 实机：
+		-- 多人局换场景必崩、单人必不崩；因为单人的护甲件是一起死的，直接走
+		-- "场景已变"那条分支停手，根本不会有"剩几个继续跑"）。
+		-- 时间照常累积到 pendingDt，所以物理速度不变，只是这几帧不写骨。
+		local grace = runtime.options and runtime.options.deathGraceFrames or 20
+		local holdUntil = runtime.frame + grace
+		if (runtime.driveHoldUntil or 0) < holdUntil then runtime.driveHoldUntil = holdUntil end
 	end
-	return dead + rebuilt
+	return dropped
 end
 
 --- 便宜的"场上有哪些玩家"扫描，供驱动中定期比对。
@@ -919,7 +945,7 @@ end
 
 --- 读调参文件（缓存，默认 2 秒重读一次）。
 --- 数字进表本身（`lift` 等），字符串原文进 `values.text`（`lift_bone` 这类骨名）。
-local function tune_values(runtime)
+tune_values = function(runtime)
 	local frame = runtime.frame or 0
 	local cached = runtime.tune
 	local refresh = (runtime.options and runtime.options.tuneRefreshFrames) or 30
@@ -1233,6 +1259,499 @@ local function apply_lift(runtime, S_)
 		cameraZ ~= nil and string.format("%.3f", cameraZ) or "?",
 		(cameraZ ~= nil and headZ ~= nil) and string.format("%+.3f", cameraZ - headZ) or "?")
 end
+
+-- ---------------------------------------------------------------------------
+-- 调度器：谁算"自己"、以及什么时候重新判定
+-- ---------------------------------------------------------------------------
+--
+-- 语义只有一条：**相机附近的那个人拿最高物理权**。
+-- 这条语义同时覆盖了三种情况，所以不需要分别处理：
+--   ① 第一/第三人称正常游玩 —— 相机在自己身上，"自己"永远排第一；
+--   ② 观战/过场把相机拉到队友身上 —— 被观看的人自动变成热点，
+--      用户在任何视角下都不会看到"我在看的那个人物理像 PPT"；
+--   ③ 身份判错（相机读不到时退化成按节点数排）—— 队友跑远 1 秒后自动纠正。
+--
+-- 关键约束：重置**只重排、不重挂**。改 owner/ownerOrder 不释放会话、不重新 attach，
+-- 所以不会闪、不会掉物理、也不需要重新读容器（那一步是几千次引擎调用）。
+
+--- 调度器参数（走调参文件，可运行时改）
+local function sched_settings(runtime)
+	local values = tune_values(runtime) or {}
+	return {
+		fallback = (values.schedFallback or 1) ~= 0,
+		metres = values.schedFallbackMetres or 6,
+		seconds = values.schedFallbackSeconds or 1,
+		minInterval = values.schedMinIntervalSeconds or 1,
+		pollFrames = math.max(1, math.floor(values.schedPollFrames or 30)),
+		-- 手动重设通道（见 sched_tune_poll / sched_key_poll）
+		resetToken = values.schedReset,
+		hotkey = (values.schedHotkey or 1) ~= 0,
+		hotkeyName = (values.text and values.text.schedHotkeyName) or "f8",
+		-- 第一人称探针的键（默认 f11；写 none 可关掉）
+		fpProbeKey = (values.text and values.text.fpProbeKey) or "f11",
+		-- 第一人称锁定：水平距离阈值（米）与确认帧数
+		fpLock = (values.fpLock or 1) ~= 0,
+		fpLockMetres = values.fpLockMetres or 0.35,
+		fpLockFrames = math.max(1, math.floor(values.fpLockFrames or 3)),
+	}
+end
+
+--- 把一个会话重新归属到"离它最近的 avatar"。
+--- 会话是护甲件，玩家那套护甲挂在 avatar 骨架上、位置几乎重合，所以这是一个可靠判据。
+local function nearest_avatar(S_, avatars, session)
+	local sx, sy, sz = readVector(S_, try(S_.Unit.world_position, session.unit, 1))
+	if sx == nil then return nil end
+	local best, bestDistance = nil, math.huge
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		if avatar.x ~= nil then
+			local dx, dy, dz = sx - avatar.x, sy - avatar.y, sz - avatar.z
+			local distance = dx * dx + dy * dy + dz * dz
+			if distance < bestDistance then best, bestDistance = avatar, distance end
+		end
+	end
+	return best
+end
+
+--- 按相机距离重排玩家顺序，并把每个会话重新归属。
+---@param forcePrimary any|nil 强制排第一的 avatar unit（第一人称锁定用）
+---@return number changed 归属真正发生变化的会话数
+local function redistribute(S_, runtime, why, forcePrimary)
+	local avatars = runtime.avatars
+	if avatars == nil or #avatars == 0 then return 0 end
+	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	local haveCamera = camX ~= nil
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
+		avatar.x, avatar.y, avatar.z = ax, ay, az
+		if haveCamera and ax ~= nil then
+			local dx, dy, dz = ax - camX, ay - camY, az - camZ
+			avatar.cameraDistance = dx * dx + dy * dy + dz * dz
+		else
+			avatar.cameraDistance = nil
+		end
+	end
+	table.sort(avatars, function(a, b)
+		local da, db = a.cameraDistance, b.cameraDistance
+		if da ~= nil and db ~= nil then return da < db end
+		if da ~= nil then return true end
+		if db ~= nil then return false end
+		return (a.nodes or 0) > (b.nodes or 0)
+	end)
+	-- 强制置顶：第一人称锁定的证据（水平距离≈0）比"总距离最近"强得多——
+	-- 队友完全可以比你离相机更近，但他的水平分量不可能≈0。
+	--
+	-- **学到过"哪个是自己"就一直沿用。** 第三人称的相机在你身后约 4.5 m，
+	-- 队友只要站得比相机离你更近，就会把你顶到 order>1，你的护甲被按 4~8 帧节流，
+	-- 看起来就是"队友有物理、我没有"。而 F8 只是重跑同一个判据，所以按了没效果
+	-- （2026-11-11 实机）。身份一旦被第一人称锁定学到，就让 F8 / 兜底重排都用它，
+	-- 这两条路径才真正能把你恢复成最高权。
+	local forced = forcePrimary
+	if forced == nil and runtime.selfUnit ~= nil then forced = runtime.selfUnit end
+	if forced ~= nil then
+		for index = 1, #avatars do
+			if avatars[index].unit == forced and index > 1 then
+				local forcedAvatar = table.remove(avatars, index)
+				table.insert(avatars, 1, forcedAvatar)
+				break
+			end
+		end
+	end
+	for index = 1, #avatars do avatars[index].order = index end
+
+	-- 最高权换人时说一声（只在真正的换人时打，避免刷屏）。
+	-- 这段时间的排障全靠这一行：能直接看出"最高权是队友还是自己"。
+	local primary = avatars[1]
+	if primary ~= nil and runtime.primaryTag ~= primary.tag then
+		runtime.primaryTag = primary.tag
+		runtime.logger("[physbone][调度] 最高权=%s（相机距离 %.2f m%s）",
+			tostring(primary.tag or "?"),
+			primary.cameraDistance ~= nil and math.sqrt(primary.cameraDistance) or -1,
+			(primary.unit == runtime.selfUnit) and "，已识别为自己" or "")
+	end
+
+	local changed, moved = 0, {}
+	for _, session in ipairs(runtime.sessions or {}) do
+		local best = nearest_avatar(S_, avatars, session)
+		if best ~= nil then
+			if session.owner ~= best.unit then
+				changed = changed + 1
+				moved[#moved + 1] = string.format("%s→%s", tostring(session.unitTag or "?"),
+					tostring(best.tag or "?"))
+				session.owner = best.unit
+				session.ownerTag = best.tag or unit_tag(S_, best.unit)
+			end
+			session.ownerOrder = best.order
+		end
+	end
+	-- 会话顺序也按新归属排：drive 里"第一位玩家不参与分帧"，靠的就是这个顺序
+	table.sort(runtime.sessions or {}, function(a, b)
+		return (a.ownerOrder or 99) < (b.ownerOrder or 99)
+	end)
+
+	runtime.avatars = avatars
+	runtime.schedResets = (runtime.schedResets or 0) + 1
+	runtime.schedLastResetFrame = runtime.frame
+	-- 只在**真变了**的时候打日志：自由相机那种"附近谁都没有"的状态下，
+	-- 这条规则会每秒触发一次，每次打一行就会把日志刷满，而且那些行没有任何信息量。
+	if changed > 0 then
+		runtime.logger("[physbone][调度] 重新分配（%s）：%d 个会话换了主人 %s%s",
+			why, changed, table.concat(moved, " "),
+			haveCamera and "" or "（相机不可读 ⇒ 只按节点数排，判据退化）")
+	else
+		runtime.schedNoop = (runtime.schedNoop or 0) + 1
+	end
+	return changed
+end
+
+--- 第一人称锁定：相机在自己根节点的**正上方** ⇒ **水平距离 ≈ 0**。
+--- <para>
+--- 实测（2026-11-11）：第一人称下"相机到自己根节点"的总距离稳定在 1.717~1.727 m
+--- （±5 mm），第三人称是 4.50~4.52 m。但**总距离不能当判据**：
+--- 队友站在你面前 1.7 m 处，总距离也是 1.7 m（相机在眼高、他的根在地面）。
+--- 真正伪造不了的是水平分量——别人的身体不可能站在你相机的那个点上（会碰撞）。
+--- 垂直分量对所有站在同层地面的人都约等于眼高，因此没有区分能力。
+--- </para>
+--- 语义：水平 < fpLockMetres 且连续 fpLockFrames 帧 ⇒ 锁定为"自己"；
+--- 若它当前不是最高权目标，立刻重排（不等 1 秒兜底）。
+local function fp_lock_watch(S_, runtime)
+	local settings = sched_settings(runtime)
+	if not settings.fpLock then return end
+	local avatars = runtime.avatars
+	if avatars == nil or #avatars == 0 then return end
+	local camX, camY = cameraPosition(S_, runtime.world, runtime.cache or {})
+	if camX == nil then return end
+	local lockAvatar, lockH = nil, nil
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		if avatar.x ~= nil then
+			local dx, dy = avatar.x - camX, avatar.y - camY
+			local h = math.sqrt(dx * dx + dy * dy)
+			if h < settings.fpLockMetres and (lockH == nil or h < lockH) then
+				lockAvatar, lockH = avatar, h
+			end
+		end
+	end
+	if lockAvatar == nil then
+		runtime.fpLockFrames = 0
+		runtime.fpLockUnit = nil
+		return
+	end
+	if runtime.fpLockUnit ~= lockAvatar.unit then
+		runtime.fpLockUnit = lockAvatar.unit
+		runtime.fpLockFrames = 1
+		runtime.fpLockH = lockH
+		return
+	end
+	runtime.fpLockFrames = (runtime.fpLockFrames or 0) + 1
+	runtime.fpLockH = lockH
+	-- 只在"恰好达到帧数"时动作一次；动作后清零，这样万一又被判错还能再纠正。
+	if runtime.fpLockFrames ~= settings.fpLockFrames then return end
+	-- 学到"自己是谁"。**即使它已经是 order==1 也要记下来**：第三人称下队友可能把你顶掉，
+	-- 之后 F8 / 兜底重排要靠这个身份把你抢回来（见 redistribute 里的沿用逻辑）。
+	if runtime.selfUnit ~= lockAvatar.unit then
+		runtime.selfUnit = lockAvatar.unit
+		runtime.logger("[physbone][调度] 记住自己=%s（水平 %.3f m）⇒ 之后 F8 与兜底重排优先它",
+			tostring(lockAvatar.tag or "?"), lockH)
+	end
+	if (lockAvatar.order or 99) == 1 then return end
+	runtime.logger("[physbone][调度] 第一人称锁定（水平 %.3f m，%s）⇒ 立即重排",
+		lockH, tostring(lockAvatar.tag or "?"))
+	redistribute(S_, runtime, "第一人称锁定", lockAvatar.unit)
+	runtime.fpLockFrames = 0
+end
+
+--- 兜底：**最高物理权单位**离开相机超过 `metres` 连续 `seconds` 秒 ⇒ 立刻重排。
+--- <para>
+--- 为什么用"它离相机远"而不是"别人离相机近"：前者只需要一次距离读取，
+--- 而且它把"观战即热点"这件事变成同一条规则的自然结果（相机换目标 ⇒ 1 秒后热点换人）。
+--- </para>
+--- 限流：最短间隔 `minInterval` 秒。**不做**"连续触发就停用"——持续触发恰恰说明
+--- 附近确实没有玩家（自由相机），此时每秒重排一次的代价（约 50 次引擎调用）
+--- 远小于它带来的正确性。连续没有变化时会自动退避，见下。
+local function scheduler_watch(S_, runtime, dt)
+	local settings = sched_settings(runtime)
+	if not settings.fallback then return end
+	local avatars = runtime.avatars
+	if avatars == nil or #avatars == 0 then return end
+	local primary = avatars[1]
+	if primary == nil or primary.unit == nil then return end
+	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	if camX == nil then return end
+	local ax, ay, az = readVector(S_, try(S_.Unit.world_position, primary.unit, 1))
+	if ax == nil then return end
+	local dx, dy, dz = ax - camX, ay - camY, az - camZ
+	local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+	if distance <= settings.metres then
+		if (runtime.schedFar or 0) > 0 then runtime.schedFar = 0 end
+		return
+	end
+	runtime.schedFar = (runtime.schedFar or 0) + (dt or (1 / 60))
+	-- 退避期：判据仍然有效，但降到 1/10 的频率（附近确实没人时别每秒重排）。
+	local need = settings.seconds
+	if runtime.schedBackoffUntil ~= nil and runtime.frame < runtime.schedBackoffUntil then
+		need = need * 10
+	end
+	if runtime.schedFar < need then return end
+
+	-- 到点了。限流：上一次重置太近就再等等（保留累积值，下一帧会再试）。
+	local last = runtime.schedLastResetFrame
+	local since = last ~= nil and (runtime.frame - last) * (dt or (1 / 60)) or math.huge
+	if since < settings.minInterval then return end
+
+	runtime.schedFar = 0
+	local changed = redistribute(S_, runtime, string.format("最高权单位距相机 %.1f m > %.0f m 持续 %.1f s",
+		distance, settings.metres, settings.seconds))
+	if changed == 0 then
+		-- 连续多次重排都没有任何变化 ⇒ 附近确实没人（自由相机/空镜头）。
+		-- 退避到 10 倍间隔，既保住正确性又不做无意义的每秒重排；有变化时立刻恢复。
+		if (runtime.schedNoop or 0) >= 3 then
+			runtime.schedBackoffUntil = runtime.frame
+				+ math.floor(settings.minInterval * 10 * 120)
+		end
+	else
+		runtime.schedNoop = 0
+	end
+end
+
+--- 每帧只刷新"每个玩家到相机的距离"，**不重排、不重新归属**。
+--- 为什么要单独这一步：分档要看新鲜距离（一秒钟前的距离可能差出十几米），
+--- 但重排是"事件级"的事（见 scheduler_watch）。这里只有 ≤4 次引擎调用。
+local function refresh_avatar_distances(S_, runtime)
+	local avatars = runtime.avatars
+	if avatars == nil or #avatars == 0 then return end
+	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	if camX == nil then return end
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
+		if ax ~= nil then
+			avatar.x, avatar.y, avatar.z = ax, ay, az
+			local dx, dy, dz = ax - camX, ay - camY, az - camZ
+			avatar.cameraDistance = dx * dx + dy * dy + dz * dz
+		end
+	end
+end
+
+--- 会话所属玩家到相机的距离平方。只查上面刷新的缓存，**不**调引擎。
+local function owner_distance_sq(runtime, session)
+	local owner = session.owner
+	if owner == nil then return math.huge end
+	local avatars = runtime.avatars
+	if avatars == nil then return math.huge end
+	for index = 1, #avatars do
+		if avatars[index].unit == owner then return avatars[index].cameraDistance or math.huge end
+	end
+	return math.huge
+end
+
+--- 预算 → 两档步长（纯函数，可离线单测）。
+--- <para>
+--- 语义：**自己永远每帧**（不参与节流，这一条不可协商）；
+--- 6 m 内先保证 2 帧一次，链数真的很多时才退到 3 帧一次；
+--- 6 m 外从 4 帧起，吃紧时最多 8 帧一次。
+--- 估算方式按"链数/步长"分摊到每帧，和实测的"约 3.5 次引擎调用/链"线性对应。
+--- </para>
+---@return number nearStride, number farStride
+local function schedule_budget(primaryChains, nearChains, farChains, budget)
+	if primaryChains + nearChains + farChains <= budget then return 1, 1 end
+	local nearStride, farStride = 2, 4
+	local function cost()
+		return primaryChains + nearChains / nearStride + farChains / farStride
+	end
+	while cost() > budget do
+		if farStride < 8 then
+			farStride = math.min(8, farStride * 2)
+		elseif nearStride < 3 then
+			nearStride = 3
+		else
+			break
+		end
+	end
+	-- 近处本来就没几条链时不必节流：让 6 m 内的队友完全每帧（那是他们最被看见的时候）
+	if nearChains <= budget * 0.25 then nearStride = 1 end
+	return nearStride, farStride
+end
+
+
+--- 手动重设的两条通道。**产品路径不得依赖外部脚本**（这套物理要随管理器分发给大量玩家），
+--- 所以按"零依赖优先"排列：
+---
+---   ① 调参文件里的 `schedReset`：写成**任意一个新的数字**就等于按了一次重置。
+---      零依赖、纯 Lua（读调参文件本来就有），玩家改一个数字即可，不需要任何额外程序。
+---   ② Stingray 自带的 `Keyboard` API（如果这个版本暴露了）——真正的一键热键。
+---      是否可用只能**实机探测**，探测结果打一行日志（见 probe_input）。
+--- 外部脚本写文件那条通道**已经删除**：玩家机器上不会有我们开发用的监听器。
+
+--- ① 调参文件通道：值变化即触发（首次读到只记录，不触发——启动时刚排好序，没必要）。
+local function sched_tune_poll(S_, runtime)
+	local settings = sched_settings(runtime)
+	if settings.resetToken == nil then return end
+	local seen = runtime.schedResetSeen
+	runtime.schedResetSeen = settings.resetToken
+	if seen == nil or seen == settings.resetToken then return end
+	redistribute(S_, runtime, string.format("手动重设（调参 schedReset=%s）",
+		tostring(settings.resetToken)))
+	runtime.schedNoop = 0
+	runtime.schedBackoffUntil = nil
+end
+
+--- 读一个键，返回"这一帧刚按下"（上升沿）。绑定/失败都只记一次日志。
+--- <para>
+--- ⚠️ 实机实测（2026-11-11）：`Keyboard.button` 返回的是 **`0` / `1`，不是布尔**。
+--- Lua 里 `0` 是**真值**，所以写成 `if value then` 会变成"永远按住"——每帧都会触发。
+--- 这里必须同时接受 `true` 和"数字非 0"两种语义。
+--- </para>
+local function key_edge(S_, runtime, name)
+	if type(name) ~= "string" or #name == 0 then return false end
+	local kb = S_.Keyboard
+	if type(kb) ~= "table" or type(kb.button) ~= "function" then return false end
+	local slots = runtime.keySlots
+	if slots == nil then slots = {}; runtime.keySlots = slots end
+	local slot = slots[name]
+	if slot == nil then
+		slot = { mode = nil }
+		slots[name] = slot
+		-- 键名拼写各版本不一致（"f8" / "F8"），调用约定也不一致（code / 名字），两种都试。
+		local candidates = { name, string.lower(name), string.upper(name) }
+		for _, spelling in ipairs(candidates) do
+			if slot.mode == nil and type(kb.button_index) == "function" then
+				local okIndex, code = pcall(kb.button_index, spelling)
+				if okIndex and code ~= nil and pcall(kb.button, code) then
+					slot.mode, slot.code, slot.spelling = "code", code, spelling
+				end
+			end
+			if slot.mode == nil and pcall(kb.button, spelling) then
+				slot.mode, slot.spelling = "name", spelling
+			end
+		end
+		if slot.mode == nil then
+			slot.broken = true
+			runtime.logger("[physbone][热键] 试过 %s 仍读不到（Keyboard 存在但调用不通）⇒ 停用",
+				table.concat(candidates, "/"))
+			return false
+		end
+		runtime.logger("[physbone][热键] 已绑定 %s（拼写=%s，调用约定=%s，code=%s）",
+			name, tostring(slot.spelling), slot.mode, tostring(slot.code))
+	end
+	if slot.broken then return false end
+	local ok, value
+	if slot.mode == "code" then
+		ok, value = pcall(kb.button, slot.code)
+	else
+		ok, value = pcall(kb.button, slot.spelling)
+	end
+	if not ok then
+		slot.broken = true
+		runtime.logger("[physbone][热键] 读取 %s 时抛错 ⇒ 停用", name)
+		return false
+	end
+	local isDown = (value == true) or (type(value) == "number" and value ~= 0)
+	local wasDown = slot.down == true
+	slot.down = isDown
+	if isDown == wasDown then return false end
+	if not isDown then
+		runtime.logger("[physbone][热键] %s 松开", name)
+		return false
+	end
+	runtime.keyEvents = (runtime.keyEvents or 0) + 1
+	return true
+end
+
+--- ② 手动重设热键（默认 F8）：按下沿触发一次重排。
+local function sched_key_poll(S_, runtime)
+	local settings = sched_settings(runtime)
+	if not settings.hotkey then return end
+	if not key_edge(S_, runtime, settings.hotkeyName) then return end
+	runtime.logger("[physbone][热键] %s 按下 ⇒ 重排（玩家 %d 个，会话 %d 个）",
+		settings.hotkeyName, #(runtime.avatars or {}), #(runtime.sessions or {}))
+	redistribute(S_, runtime, "手动重设（热键 " .. settings.hotkeyName .. "）")
+	runtime.schedNoop = 0
+	runtime.schedBackoffUntil = nil
+end
+
+--- 第一人称探针（默认 F11）：按一次打**一行**——相机位置 + 每个玩家到相机的距离。
+--- <para>
+--- 要回答的问题：第一人称下"自己与相机的距离"是不是固定且接近 0？
+--- 如果是（且第三人称是 2~4 m），那它就比"离相机最近的那个"可靠得多，
+--- 可以用来做**精确身份判据**（锁定 ⇒ 3 帧内立即重排，不等 1 秒兜底）。
+--- 采用按键触发而不是定时打日志：只要切换前后的两个瞬时值，不需要刷屏。
+--- </para>
+local function fp_probe_poll(S_, runtime)
+	local settings = sched_settings(runtime)
+	if not settings.fpProbeKey then return end
+	if not key_edge(S_, runtime, settings.fpProbeKey) then return end
+	local avatars = runtime.avatars or {}
+	local camX, camY, camZ = cameraPosition(S_, runtime.world, runtime.cache or {})
+	local parts = {}
+	for index = 1, #avatars do
+		local avatar = avatars[index]
+		local ax, ay, az = readVector(S_, try(S_.Unit.world_position, avatar.unit, 1))
+		local text = "?"
+		if camX ~= nil and ax ~= nil then
+			local dx, dy, dz = ax - camX, ay - camY, az - camZ
+			local horizontal = math.sqrt(dx * dx + dy * dy)
+			text = string.format("%.4fm(h=%.4f,v=%+.4f)",
+				math.sqrt(dx * dx + dy * dy + dz * dz), horizontal, dz)
+		end
+		parts[#parts + 1] = string.format("%s=%s%s", tostring(avatar.tag or "?"), text,
+			(avatar.order or 99) == 1 and "(主)" or "")
+	end
+	local chains = 0
+	for _, session in ipairs(runtime.sessions or {}) do
+		chains = chains + #(session.sessions or {})
+	end
+	runtime.logger(
+		"[physbone][FP探针] 相机=(%.3f,%.3f,%.3f) 玩家=%d 会话=%d 链=%d 距离: %s",
+		camX or 0, camY or 0, camZ or 0, #avatars, #(runtime.sessions or {}), chains,
+		#parts > 0 and table.concat(parts, " ") or "（没有玩家）")
+end
+
+--- ③ 已删除：外部脚本写文件的通道。
+--- 这套物理要随管理器分发给大量玩家，产品路径不能依赖任何外部程序
+--- （玩家机器上不会有我们开发用的 Python 监听器）。上面两条已经够用：
+--- 原生键盘能用就一键，不能用就改调参文件里的一个数字。
+
+--- 输入 API 一次性探测：只**读类型**（不调有副作用的函数），把结果打进日志。
+--- 为什么要它：能不能绑原生热键完全取决于这个版本暴露了什么，
+--- 而"猜一个 API 名字然后静默失败"是这一整层最贵的错误类型。
+local function probe_input(S_, runtime)
+	if runtime.inputProbed == true then return end
+	runtime.inputProbed = true
+	local kb = S_.Keyboard
+	local parts = { "Keyboard=" .. type(kb) }
+	if type(kb) == "table" then
+		for _, name in ipairs({ "button", "button_index", "keystroke", "any_button" }) do
+			parts[#parts + 1] = name .. "=" .. type(kb[name])
+		end
+	end
+	parts[#parts + 1] = "InputManager=" .. type(S_.InputManager)
+	parts[#parts + 1] = "Window=" .. type(S_.Window)
+	runtime.logger("[physbone][探测] 输入 API：%s", table.concat(parts, " "))
+	if type(kb) == "table" and type(kb.button_index) == "function" and type(kb.button) == "function" then
+		local okCode, code = pcall(kb.button_index, "f8")
+		local down = nil
+		if okCode and code ~= nil then
+			local okDown, value = pcall(kb.button, code)
+			if okDown then down = value end
+		end
+		runtime.logger("[physbone][探测] F8 试读：code=%s down=%s", tostring(code), tostring(down))
+	end
+end
+
+
+--- 每帧统一入口。成本：一次调参比对 + 两个键各读一次（`Keyboard.button` 是纯查询）。
+local function sched_poll(S_, runtime)
+	probe_input(S_, runtime)
+	sched_tune_poll(S_, runtime)
+	sched_key_poll(S_, runtime)
+	fp_probe_poll(S_, runtime)
+end
+
+
+
 
 -- ---------------------------------------------------------------------------
 -- 姿态快照：按一下键，把当前玩家这一具骨架的世界变换写到盘上
@@ -2191,6 +2710,18 @@ local function drive(runtime)
 	local options = runtime.options
 	local logger = runtime.logger
 	runtime.logContext.frame = frame
+
+	-- 诊断开关（`hardOff = 1`）：运行时**加载了但一个引擎调用都不发**。
+	-- 用途（2026-11-11）：确认"仅仅是这份 runtime 存在"是否已经足够引发崩溃。
+	-- 放在任何引擎调用之前，所以连 Compat.begin_frame 都不跑。
+	if (tune_values(runtime).hardOff or 0) ~= 0 then
+		if not runtime.hardOffLogged then
+			runtime.hardOffLogged = true
+			logger("[physbone][诊断] hardOff=1 ⇒ 运行时不动手（不发任何引擎调用）")
+		end
+		return
+	end
+
 	Compat.begin_frame(frame)
 
 	-- dt 用引擎自己的时间差，不写死 1/60。
@@ -2212,6 +2743,7 @@ local function drive(runtime)
 		elseif now > previous then
 			local delta = now - previous
 			-- 上限 0.25 与 compat 的稳定性闸一致：卡顿帧不该被当成"过了 0.5 秒"去积分。
+			runtime.rawDelta = delta               -- 限幅前的真实跨度，供"加载空档"判据用
 			if delta > 0.25 then delta = 0.25 end
 			if delta >= 0.001 then runtime.dt = delta end
 			advanced = true
@@ -2235,9 +2767,48 @@ local function drive(runtime)
 	end
 	if not advanced then return end
 
+	-- ---------- 加载空档：不查存活，直接整组重挂 ----------
+	-- 加载界面期间 `render`/`update` 根本不跑（实测：静默 4~15 秒是常态），而这一整段时间里
+	-- 引擎正在销毁上一场景的 unit。等我们再被调到，`runtime.sessions` 里那些句柄很可能
+	-- 已经指向被释放的对象 —— 而**逐条查存活本身就是一个引擎调用**（`Compat.session_health`
+	-- → `Unit.alive`）。在"unit 已经被覆盖/释放"的窗口里发这个调用，就是原生崩溃
+	-- （2026-11-11 实机：崩在 0x3e564b 读空指针，且**只在物理 + 软映射同时开**时发生 ——
+	-- 因为只有那时该 unit 是覆盖出来的自定义件；单独开任意一个都不崩）。
+	-- 所以这里**不逐条判定**，整组丢掉、按"场景已变"重挂。宁可闪一下，也不去碰可能已死的句柄。
+	local gap = runtime.rawDelta
+	if gap ~= nil and gap > (options.loadGapSeconds or 0.5)
+		and runtime.sessions ~= nil and #runtime.sessions > 0 then
+		logger("[physbone][LIFECYCLE] 检测到加载空档 %.2f s ⇒ 不查存活，直接整组重挂（%d 个会话）",
+			gap, #runtime.sessions)
+		runtime.sessions = nil
+		runtime.reconcile = nil
+		runtime.reArm = 1
+		runtime.rearmAt = frame + (options.reArmFrames or 60)
+	end
+	runtime.rawDelta = nil
+
 	if runtime.sessions ~= nil and #runtime.sessions > 0 then
 		local dropped = pruneSessions(runtime)
-		if #runtime.sessions == 0 then
+		-- **默认行为**：任何会话死亡 ⇒ 整组释放，一个句柄都不留。
+		--
+		-- 依据（2026-11-11 实机 + 用户对照实验 + 开关二分，已确认修复闪退）：
+		--   · `discoverOnly=1`（只扫描、**不持有句柄**）⇒ 不崩；
+		--   · `writeOff=1`（挂载但不写骨）⇒ 仍崩 ⇒ 与写骨无关；
+		--   · 两人**同时**切图才崩；多人局里自己一个人切图不崩；中途加入不崩。
+		-- 崩溃日志总是「掉了 N 个会话，**剩 M 个继续跑**」：那 M 个句柄被留着，
+		-- 紧接着是几十秒加载空档（render 不再回调、修剪跑不到），引擎在销毁它们
+		-- ⇒ 读空指针（转储 0x3e564b，异常参数 0x0 0x0）。
+		--
+		-- 代价：队友换甲/阵亡时全场会闪一下没物理（随后立刻重挂）。
+		-- 想退回旧行为（保留剩余会话）可在调参文件写 `dropAllOnDeath = 0`。
+		if dropped > 0 and (tune_values(runtime).dropAllOnDeath or 1) ~= 0 then
+			logger("[physbone][LIFECYCLE] dropAllOnDeath=1：掉了 %d 个会话 ⇒ 整组释放（不留任何句柄），随后重挂",
+				dropped)
+			runtime.sessions = nil
+			runtime.reconcile = nil
+			runtime.reArm = 1
+			runtime.rearmAt = frame + 1
+		elseif #runtime.sessions == 0 then
 			-- 全没了（换场景 / 全员阵亡）：退回等待，带退避（避免换甲期间每秒重挂一次）。
 			-- 存活时长决定退避：刚挂上就死 = 抖动（换甲中），要越等越久；
 			-- 稳定跑过 5 秒再死 = 正常换场景，下一次应当**立刻**重挂。
@@ -2301,52 +2872,59 @@ local function drive(runtime)
 		runtime.waitSince = nil
 	end
 
+	-- ---------- 调度（谁拿最高物理权） ----------
+	-- 放在驱动之前：这一帧的驱动顺序就用新排好的结果。
+	-- 顺序有依赖：先把"每个玩家到相机的距离"刷新（≤4 次调用），
+	-- 热键探针、第一人称锁定、预算分档都用这一份新鲜值。
+	refresh_avatar_distances(S, runtime)
+	sched_poll(S, runtime)
+	fp_lock_watch(S, runtime)
+	scheduler_watch(S, runtime, runtime.dt)
+
 	-- ---------- 驱动 ----------
 	-- 计时不可靠（`Application.time_since_launch` 每帧只更新一次、`os.clock()` 被引擎其它
 	-- 线程污染），所以性能只报**引擎调用次数**——唯一不会被环境噪声污染的口径。
 	--
-	-- 多人局的**预算**：一帧的驱动成本几乎正比于链数（实测单人 52 链 ≈ 180 次引擎调用/帧，
-	-- 约 3.5 次/链）。四个玩家同屏就是 4 倍。真到那个量级还没问题，但"每人身上好几套 mod"
-	-- 会让链数继续翻，所以这里给一条闸：**第一位玩家（离相机最近的那个，也就是自己）每帧都算；
-	-- 其余玩家按 stride 分帧**，被动到的那一帧用**累积的 dt** 积分（compat 内部还会再拆子步），
-	-- 所以物理速度不变，只是采样率降到 1/2。观感差别极小，成本直接对半。
-	local chainTotal = 0
-	for index = 1, #runtime.sessions do
-		chainTotal = chainTotal + #(runtime.sessions[index].sessions or {})
-	end
-	local budget = options.maxChainsPerFrame or 160
-	-- 首位玩家（自己）身上的链数：这部分**不参与分帧**，始终每帧算。
-	local primaryChains = 0
-	if runtime.sessions[1] ~= nil then
-		primaryChains = #(runtime.sessions[1].sessions or {})
-	end
-	-- ── 自适应分帧（2026-11-03 实机：四人局红色折线约是绿色两倍、掉到 40 fps）──
-	-- 旧实现是**固定 stride=2**，于是四人局的实际工作量是
-	--     自己 418 链/帧 + 队友 3×418/2 ≈ 1045 链/帧
-	-- 完全没有被 budget 约束住 —— 每帧预算形同虚设，玩家越多越线性变慢。
+	-- 预算分配的目标不是"省"，而是**把清晰度按距离给出去**：
+	--   · 自己（相机旁的那位）永远每帧，不参与任何节流；
+	--   · 6 m 内的队友：每 2 帧一次（≈35~60 Hz 采样，肉眼基本看不出来）；
+	--   · 6 m 外的队友：每 4 帧起，链数吃紧时最多退到每 8 帧一次。
+	-- 老实现是"所有队友共用一个步长"，于是 6 m 内的队友和 60 m 外的一样稀疏，
+	-- 而且 4 人局步长一律顶到上限 16（≈6 Hz）——这就是"队友物理像 PPT"的量化来源。
 	--
-	-- 现在按"队友链数 / 队友预算"反推步长：队友那边每帧最多驱动 budget/2 条链。
-	-- 于是总工作量被压到 (自己 + budget/2) 附近，不再随玩家人数线性增长。
-	-- dt 仍然累积补偿（compat 内部会再拆子步），所以**物理速度不变，只是队友的采样率下降**。
-	-- 观感上：队友通常在画面里很小/很远，降采样几乎看不出来；自己永远是全速率。
-	local otherChains = chainTotal - primaryChains
-	local stride = 1
-	local otherBudget = math.max(math.floor(budget / 2), 24)
-	-- 只有**真的超预算**才分帧：队友链数在预算内时仍按每帧驱动（别为了省而省）。
-	if otherChains > otherBudget then
-		stride = math.max(2, math.ceil(otherChains / otherBudget))
-		local cap = options.maxOtherPlayerStride or 16
-		if stride > cap then stride = cap end
-	end
-	if stride ~= runtime.driveStride then
-		runtime.driveStride = stride
-		if stride > 1 then
-			logger("[physbone][预算] 自己 %d 链/帧 + 队友 %d 链 ⇒ 队友每 %d 帧驱动一次（每帧预算 %d；dt 累积补偿，速度不变）",
-				primaryChains, otherChains, stride, budget)
+	-- 被跳过的帧都把 dt **累积**到下一次（compat 内部再拆子步），
+	-- 所以物理速度不变，变的只是采样率。
+
+	-- 距离已经在这一帧开头刷新过了（见调度块），这里不再重复读。
+
+	local budget = options.maxChainsPerFrame or 160
+	-- 分档边界与兜底阈值共用同一个数（用户要的就是"6 m 这个清晰边界"）：
+	-- 近 = 会被看清的那个范围，远 = 只有轮廓的范围。
+	local nearMetres = sched_settings(runtime).metres
+	local nearLimit2 = nearMetres * nearMetres
+	local primaryChains, nearChains, farChains = 0, 0, 0
+	for index = 1, #runtime.sessions do
+		local session = runtime.sessions[index]
+		local chains = #(session.sessions or {})
+		if (session.ownerOrder or 99) <= 1 then
+			primaryChains = primaryChains + chains
+		elseif owner_distance_sq(runtime, session) <= nearLimit2 then
+			nearChains = nearChains + chains
 		else
-			logger("[physbone][预算] 链数 %d 在每帧预算 %d 以内 ⇒ 所有玩家恢复每帧驱动",
-				chainTotal, budget)
+			farChains = farChains + chains
 		end
+	end
+	local nearStride, farStride = schedule_budget(primaryChains, nearChains, farChains, budget)
+	if nearStride ~= runtime.nearStride or farStride ~= runtime.farStride then
+		runtime.nearStride, runtime.farStride = nearStride, farStride
+		logger("[physbone][预算] 自己 %d 链/帧 · %.0f m 内队友 %d 链（每 %d 帧）· 远处 %d 链（每 %d 帧）· 每帧预算 %d",
+			primaryChains, nearMetres, nearChains, nearStride, farChains, farStride, budget)
+	end
+	if primaryChains > budget and runtime.budgetOverLogged ~= true then
+		runtime.budgetOverLogged = true
+		logger("[physbone][预算] 自己身上 %d 链已超过每帧预算 %d：**不会**降低自己的采样率，"
+			.. "队友会被压到最大节流（这是设计选择：自己的观感优先）",
+			primaryChains, budget)
 	end
 
 	local written, skippedSame, engineCalls, staticChains = 0, 0, 0, 0
@@ -2360,8 +2938,36 @@ local function drive(runtime)
 		-- 时间**永远**先累积：没被驱动的这一帧不是"时间不存在"，攒到下一次一起积。
 		-- 丢了它，物理会比真实时间慢 —— 表现是"队友的头发像在水里"。
 		local pending = (session.pendingDt or 0) + dt
-		local order = session.ownerOrder or 1
-		local due = stride <= 1 or order <= 1 or (frame % stride) == ((order - 1) % stride)
+		local order = session.ownerOrder or 99
+		local due = true
+		if order > 1 then
+			local stride = owner_distance_sq(runtime, session) <= nearLimit2 and nearStride or farStride
+			-- 用**会话下标**错峰，而不是玩家序号：同一个玩家的若干护甲件如果同帧，
+			-- 每 stride 帧就会出现一次成本尖峰（帧时间抖动比平均成本更影响手感）。
+			if stride > 1 and ((frame + index) % stride) ~= 0 then due = false end
+		end
+		-- 拆解窗口：任何会话死亡后的一小段里不写骨（理由见 pruneSessions 里那段注释）。
+		-- 仍然走"没轮到"的同一条路，所以 pendingDt 照常累积、物理速度不变。
+		if due and runtime.driveHoldUntil ~= nil and frame < runtime.driveHoldUntil then due = false end
+		-- 诊断开关（调参文件 `writeOff = 1`）：发现 / 挂载 / 调度 / 判活全都照旧，**只是不写骨**。
+		-- 用途（2026-11-11）：物理 + 软映射同时开、多人局换场景必崩，而崩溃时我们的 Lua 根本没在跑
+		-- （加载期间不回调，回来之前就崩了）。于是只剩两种可能，这个开关能把它们分开：
+		--   不崩 ⇒ 触发点是"写骨"这条路径（在写入侧加固）；
+		--   还崩 ⇒ 只要"挂着并持有 unit 句柄"就足够（要在换人/换场景时尽早放手）。
+		if due and (tune_values(runtime).writeOff or 0) ~= 0 then
+			if not runtime.writeOffLogged then
+				runtime.writeOffLogged = true
+				logger("[physbone][诊断] writeOff=1 ⇒ 只挂不写（用于分辨崩溃是否由写骨触发）")
+			end
+			due = false
+		end
+		-- 写骨前再复查一次存活：pruneSessions 只在**帧首**判过，
+		-- 而场景拆解会在本帧中途继续释放 unit —— 那一小段窗口正是"写进野对象"的来源。
+		-- unit_alive 是便宜的引擎调用，比赌一次野指针便宜得多。
+		if due and session.unit ~= nil and type(Compat.unit_alive) == "function" then
+			local okAlive, alive = pcall(Compat.unit_alive, S, session.unit)
+			if okAlive and alive == false then due = false end
+		end
 		if not due then
 			session.pendingDt = pending
 		else
@@ -2391,7 +2997,7 @@ local function drive(runtime)
 
 	runtime.callsAccum = (runtime.callsAccum or 0) + engineCalls
 	runtime.staticChains = staticChains
-	runtime.lastChainTotal = chainTotal
+	runtime.lastChainTotal = primaryChains + nearChains + farChains
 	runtime.lastAttempted = attempted
 	-- 这一帧一条都没驱动（stride 分帧的正常现象）时不能让"零帧看门狗"累加，
 	-- 否则分帧本身会被误判成"驱动失效"→ 重挂 → 分帧 → 再判失效，无限循环。
@@ -2435,8 +3041,8 @@ local function drive(runtime)
 	if (runtime.driveFrames % heartbeat) == 0 then
 		local chains = 0
 		for _, session in ipairs(runtime.sessions) do chains = chains + #session.sessions end
-		logger("[physbone] 驱动心跳 unit=%d 链=%d 玩家=%d 分帧=%d 本帧驱动=%d dt=%.4f 本帧 写入=%d 跳过=%d 引擎调用=%d 累计/帧=%.0f 静止链=%d 偏离绑定峰值=%.1f°(史上%.1f°) 最离谱=%s(限%.0f°) 同拍重复=%d",
-			#runtime.sessions, chains, #(runtime.avatars or {}), runtime.driveStride or 1, attempted,
+		logger("[physbone] 驱动心跳 unit=%d 链=%d 玩家=%d 分帧=%d/%d 本帧驱动=%d dt=%.4f 本帧 写入=%d 跳过=%d 引擎调用=%d 累计/帧=%.0f 静止链=%d 偏离绑定峰值=%.1f°(史上%.1f°) 最离谱=%s(限%.0f°) 同拍重复=%d",
+			#runtime.sessions, chains, #(runtime.avatars or {}), runtime.nearStride or 1, runtime.farStride or 1, attempted,
 			runtime.dt or 0, written, skippedSame, engineCalls,
 			runtime.callsAccum / runtime.driveFrames, staticChains, framePeakDeg,
 			runtime.peakAngle or 0,
@@ -2535,7 +3141,8 @@ function M.install(stingray, options)
 		-- 名单变化只影响"补挂/收尾"，不会推翻别人的会话。
 		avatars = nil,
 		reconcile = nil,     -- 名单变化后待执行的补挂帧号；nil = 没有待办
-		driveStride = 1,     -- 当前的分帧步长（链数超预算时 >1）
+		nearStride = 1,      -- 6 m 内队友的分帧步长（1 = 每帧）
+		farStride = 1,       -- 6 m 外队友的分帧步长
 		frame = 0,
 		dt = options.dt or (1 / 60),
 		reArm = 0,
@@ -2620,4 +3227,21 @@ M.snapshot_json_ = snapshot_json
 M.snapshot_poll_ = snapshot_poll
 M.snapshot_dir_ = snapshot_dir
 
+-- 测试钩子：调度器。重排与兜底都是纯逻辑（给定相机和一堆位置就能算），
+-- 所以可以离线钉住"位置互换后归属必须跟着换""限流必须挡住连续触发"。
+M.redistribute_ = redistribute
+M.scheduler_watch_ = scheduler_watch
+M.sched_poll_ = sched_poll
+M.sched_settings_ = sched_settings
+M.schedule_budget_ = schedule_budget
+M.key_edge_ = key_edge
+M.fp_probe_poll_ = fp_probe_poll
+M.fp_lock_watch_ = fp_lock_watch
+
 return M
+
+
+
+
+
+
