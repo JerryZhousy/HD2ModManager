@@ -127,6 +127,9 @@ local function newCompat()
 		local unit = units[1]
 		return { rig = { bones = { { name = "hair" } } }, path = "data/fake.gpu_resources", full = true, score = 1, total = #unit.name }
 	end
+	-- 便宜预筛（runtime 会先问它"有没有可能全命中"再决定要不要真打分）。
+	-- 这个壳里所有候选都是"能命中"的，所以一律放行。
+	compat.probe_carriers = function() return true end
 	compat.attach = function(_, unit, _, _)
 		local session = {
 			unit = unit,
@@ -323,6 +326,32 @@ do
 	check(selfCount == frames, "自己（离相机最近）每帧都在算", selfCount .. "/" .. frames)
 end
 
+-- ================================================================ 场景 4b：自己永远不分帧
+io.stdout:write("\n[场景 4b] 自己的链数再大也不分帧（分帧 = 自己身上闪烁）\n")
+--
+-- 实机 2026-11-12：我一度让"自己的链数超预算时也按比例分帧"，用户立刻看到**头发/裙子闪烁** ——
+-- 被跳过的帧里引擎把那些骨重新置回动画/绑定姿态，画面就在"物理姿态"和"绑定姿态"之间反复跳。
+-- 所以规则改成硬约束：**自己永不分帧**；省成本只能靠"少挂件数/认对目标"。
+do
+	local fake = newFake()
+	local compat = newCompat()
+	fake:playerAt("p1", 0, 400)          -- 一个玩家 400 条链，远超预算 160
+	local runtime = freshRuntime(fake, compat, { maxChainsPerFrame = 160 })
+	fake:advance(80)
+	check(runtime.primaryStride == 1, "自己不分帧（步长恒为 1）",
+		"primaryStride=" .. tostring(runtime.primaryStride))
+
+	-- 每一帧都必须驱动自己（否则就是闪烁的来源）。
+	compat.dtByUnit = {}
+	local frames = 12
+	fake:advance(frames, 0.01)
+	local selfCount = 0
+	for _, entry in ipairs(compat.dtByUnit) do
+		if entry.unit == "p1-armor" then selfCount = selfCount + 1 end
+	end
+	check(selfCount == frames, "自己每帧都在算", selfCount .. "/" .. frames)
+end
+
 -- ================================================================ 场景 5：分帧不能被当成驱动失效
 io.stdout:write("\n[场景 5] 分帧期间不触发「驱动失效」重挂\n")
 do
@@ -468,4 +497,3 @@ end
 
 io.stdout:write(string.format("\n%s：%d 项检查，%d 项失败\n", failures == 0 and "全部通过" or "有失败", checks, failures))
 os.exit(failures == 0 and 0 or 1)
-

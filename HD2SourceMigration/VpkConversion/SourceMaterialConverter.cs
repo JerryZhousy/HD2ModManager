@@ -392,6 +392,9 @@ public enum NormalDelivery
 
 	/// <summary>声明了法线图，但来源里找不到那张 <c>.vtf</c>，只能退回平面法线。</summary>
 	TextureMissing = 2,
+
+	/// <summary><c>$bumpmap</c> 是裸名单段（如基材质模板里的 <c>normal</c>）：占位写法，源侧不加载那张图。</summary>
+	PlaceholderPath = 3,
 }
 
 /// <summary>
@@ -1630,10 +1633,14 @@ public sealed class SourceMaterialConverter
 		if (string.IsNullOrWhiteSpace(bumpStem))
 			return NormalDelivery.TextureMissing;
 
-		// **判据是"来源里有没有这张图"**，不是"能不能解出来"——解码失败要跑一次 texconv，
-		// 在统计阶段做这件事会把整包扫描变成几分钟。真正的解码失败会走
-		// `TryNormalRoughnessTexture` 的保底路径（退回平面法线），结果一样是不接法线。
-		return source.ContainsVtf(bumpStem) ? NormalDelivery.Wired : NormalDelivery.TextureMissing;
+		// 判据是"按声明路径找得到"，不是"能不能解出来"——解码失败会走保底路径，结果一样是不接法线。
+		if (source.TryResolveDeclaredTexture(bump, out _))
+			return NormalDelivery.Wired;
+
+		// 带目录 = 材质包缺图；裸名单段 = 占位写法，不兜底。
+		return VmtDocument.NormalizePath(bump).Contains('/')
+			? NormalDelivery.TextureMissing
+			: NormalDelivery.PlaceholderPath;
 	}
 
 	/// <summary>见 <see cref="DescribeBumpMap"/>。</summary>
@@ -2031,9 +2038,10 @@ public sealed class SourceMaterialConverter
 		// 而 NekoToon 那套模型普遍带 ATI2N/BC5 高清法线图（官方文档 `pbr.vmt` /
 		// `nekotoon.vmt` 都写着 `$bumpmap` + `$bumpstrength`）。现在它在装配时决定
 		// "这张材质要不要配一张自己的法线贴图"，见 `TryBuildNormalTexture`。
-		var bumpTextureName = string.IsNullOrWhiteSpace(vmt.Value("$bumpmap"))
-			? null
-			: Path.GetFileNameWithoutExtension(VmtDocument.NormalizePath(vmt.Value("$bumpmap")!));
+		// 必须按声明路径解析：裸名兜底会把 `"$bumpmap" "normal"` 这种占位绑到名字碰巧相同的旧图上。
+		var bumpTextureName = source.TryResolveDeclaredTexture(vmt.Value("$bumpmap"), out var resolvedBump)
+			? resolvedBump
+			: null;
 		var bumpStrength = MaterialAppearance.ParseBumpStrength(vmt.Value("$bumpstrength"));
 
 		// matcap 的**合成参数**（N2）：模式 + 逐通道强度 + 蒙版。
@@ -3685,20 +3693,6 @@ public sealed class SourceMaterialConverter
 				}
 
 				break;
-			case 5:    // I8 -> 灰度（亮度图，没有 alpha，补 255）
-				// 实测 `eye_self`（眼睛自发光遮罩）就是 I8：以前这里没有分支，
-				// 解码直接抛"不在已实现的非压缩拆包列表里"，于是整包材质转换失败 ——
-				// 而失败又被下游当成"读到空像素"，最终表现为脸部在游戏里是品红。
-				Require(source, pixels, vtf.FormatName);
-				for (var i = 0; i < pixels; i++)
-				{
-					output[(i * 4) + 0] = source[i];
-					output[(i * 4) + 1] = source[i];
-					output[(i * 4) + 2] = source[i];
-					output[(i * 4) + 3] = 255;
-				}
-
-				break;
 			case 6:    // IA88 -> 灰度 + alpha
 				Require(source, pixels * 2, vtf.FormatName);
 				for (var i = 0; i < pixels; i++)
@@ -3707,6 +3701,23 @@ public sealed class SourceMaterialConverter
 					output[(i * 4) + 1] = source[i * 2];
 					output[(i * 4) + 2] = source[i * 2];
 					output[(i * 4) + 3] = source[(i * 2) + 1];
+				}
+
+				break;
+			case 5:    // I8 -> 灰度（alpha 补 255）
+				// 1 字节/像素的灰度图，常见的"自发光蒙版"/"发光遮罩"就是这种格式。
+				// 补 A=255 而不是复制灰度：I8 没有 alpha 通道，蒙版读的是 RGB 亮度，
+				// 把亮度也写进 A 会让"当作透明度用"的那条路读出一个假的半透明。
+				// 实测 `eye_self`（眼睛自发光遮罩）就是 I8：以前这里没有分支，解码直接抛
+				// "不在已实现的非压缩拆包列表里"，整包材质转换失败 —— 而失败又被下游当成
+				// "读到空像素"，最终表现为脸部在游戏里是品红。
+				Require(source, pixels, vtf.FormatName);
+				for (var i = 0; i < pixels; i++)
+				{
+					output[(i * 4) + 0] = source[i];
+					output[(i * 4) + 1] = source[i];
+					output[(i * 4) + 2] = source[i];
+					output[(i * 4) + 3] = 255;
 				}
 
 				break;
@@ -3740,6 +3751,12 @@ public sealed class SourceMaterialConverter
 	/// <summary>
 	/// 读一张贴图并解成裸像素（带 <see cref="DecodeTextureCached"/> 的复用）。
 	/// 供 matcap 合成读 matcap / 蒙版 / 法线用——它们只需要像素，不需要走材质那一套。
+	/// <para>
+	/// <b>失败时三个输出参数必须一起"归零"。</b>调用方只按「宽高 &gt; 0」判断"读到了"，
+	/// 留下"宽高有值、像素是空数组"的半成品会让它们按读到了去索引空数组——
+	/// 实测事故：`ramune-战术女仆(louis).vpk` 的 `I8` 自发光蒙版解不出来，整批转换抛
+	/// <c>IndexOutOfRangeException</c>，管理器侧只给一句"重新转换失败"。
+	/// </para>
 	/// </summary>
 	private bool TryReadTextureRgba(string textureName, out byte[] rgba, out int width, out int height)
 	{
@@ -3755,6 +3772,10 @@ public sealed class SourceMaterialConverter
 			width = vtf.Width;
 			height = vtf.Height;
 			rgba = DecodeTextureCached(textureName, bytes, vtf);
+			var expected = (long)width * height * 4;
+			if (rgba.Length < expected)
+				throw new InvalidDataException(
+					$"贴图 {textureName} 解码后只有 {rgba.Length} 字节，不足以填满 {width}x{height} 的 RGBA（应为 {expected}）");
 			return width > 0 && height > 0;
 		}
 		catch (Exception exception) when (IsTextureReadFailure(exception))
