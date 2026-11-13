@@ -97,7 +97,7 @@ end
 -- Unit.bones / scene_graph_parent / scene_graph_link / is_a / is_child，
 -- 进舰船几秒后游戏崩了（0xc0000005，参数 0x0 0x0）。`pcall` 拦不住原生 AV。
 -- 所以这些调用只允许待在**显式开关控制、默认关闭**的探针函数里：
---   · `probe_identity_api`（开关 `probeIdentity`）
+--   · `probe_identity_api`（开关 `probeIdentity`，默认关）
 --   · `probe_identity_link`（开关 `probeIdentityLink`，默认关）
 local function count_plain(text, needle)
 	local count, at = 0, 1
@@ -132,6 +132,19 @@ check("两组探针都有开关（probeIdentity / probeIdentityLink）",
 		and wholeStripped:find("probeIdentityLink", 1, true) ~= nil)
 check("身份链探针默认关闭（只在开关非 0 时才调）",
 	wholeStripped:find("identSwitch ~= nil and identSwitch ~= 0", 1, true) ~= nil)
+check("身份 API 探针默认关闭（只在开关非 0 时才调）",
+	wholeStripped:find("probeSwitch ~= nil and probeSwitch ~= 0", 1, true) ~= nil
+		and wholeStripped:find("probeSwitch == nil or", 1, true) == nil)
+-- 2.1.44：心跳不能拿 driveFrames 取模 —— 补挂每次成功都把它归零，挂满之后心跳就永远打不出来。
+check("心跳用独立计数 beatFrames（不被补挂归零）",
+	wholeStripped:find("(runtime.beatFrames % heartbeat) == 0", 1, true) ~= nil
+		and wholeStripped:find("(runtime.driveFrames % heartbeat)", 1, true) == nil)
+check("beatFrames 只在安装时归零（tryAttach 不碰它）",
+	select(2, wholeStripped:gsub("beatFrames = 0", "")) == 1)
+-- 调参文件里 0 一律表示关（devLog / skirt 都是这个约定）。心跳不能例外：
+-- `math.max(1, …)` 会把 0 变成"每帧一条"，一场长局刷几万行，正好烧光心跳要省的预算。
+check("心跳间隔写 0 = 关（不是每帧一条）",
+	wholeStripped:find("heartbeat > 0 and (runtime.beatFrames % heartbeat) == 0", 1, true) ~= nil)
 
 print(string.format("\n失败 %d 项", failures))
 os.exit(failures == 0 and 0 or 1)
