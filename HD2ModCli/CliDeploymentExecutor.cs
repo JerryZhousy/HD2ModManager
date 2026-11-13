@@ -78,7 +78,13 @@ internal static class CliDeploymentExecutor
 				current.OwnershipInspection,
 				executionPlan.Operations,
 				cancellationToken).ConfigureAwait(false);
-			var applyResult = await CoreServices.CreateApplyExecutor().ExecuteAsync(executionPlan, CancellationToken.None).ConfigureAwait(false);
+			// 预检与部署后校验都要按内容证明"投放的就是库里那份"，硬链接部署时读的都是源文件。
+			// 把 CLI 的哈希缓存接进去：规划阶段已经算过的源文件直接命中，不再把几 GB 重读一遍。
+			var hashCache = CliPatchHashCache.Load(workspace.ManagerRoot);
+			var applyResult = await CoreServices.CreateApplyExecutor()
+				.ExecuteAsync(executionPlan, CancellationToken.None, (path, token) => hashCache.GetOrComputeAsync(path, token))
+				.ConfigureAwait(false);
+			await hashCache.SaveAsync(CancellationToken.None).ConfigureAwait(false);
 			var applyDiagnostics = ToDiagnostics(applyResult.Issues, "apply");
 			if (applyResult.Success)
 			{
