@@ -30,7 +30,8 @@ public sealed class DeploymentOwnershipInspector : IDeploymentOwnershipInspector
 
 	public async ValueTask<DeploymentOwnershipInspection> InspectAsync(
 		string? gameDataDirectory,
-		CancellationToken cancellationToken = default)
+		CancellationToken cancellationToken = default,
+		Func<string, CancellationToken, ValueTask<string>>? contentHasher = null)
 	{
 		cancellationToken.ThrowIfCancellationRequested();
 		var issues = new List<CoreIssue>();
@@ -213,7 +214,8 @@ public sealed class DeploymentOwnershipInspector : IDeploymentOwnershipInspector
 				declaredTargetPaths,
 				declaredIdentityKeys,
 				issues,
-				cancellationToken);
+				cancellationToken,
+				contentHasher);
 		}
 
 		foreach (var patch in scan.Patches)
@@ -328,7 +330,8 @@ public sealed class DeploymentOwnershipInspector : IDeploymentOwnershipInspector
 		ISet<string> declaredTargetPaths,
 		ISet<string> declaredIdentityKeys,
 		List<CoreIssue> issues,
-		CancellationToken cancellationToken)
+		CancellationToken cancellationToken,
+		Func<string, CancellationToken, ValueTask<string>>? contentHasher = null)
 	{
 		if (entry is null)
 		{
@@ -447,7 +450,19 @@ public sealed class DeploymentOwnershipInspector : IDeploymentOwnershipInspector
 		try
 		{
 			cancellationToken.ThrowIfCancellationRequested();
-			var actualHash = await ComputeSha256Async(actualPatch.Path, cancellationToken).ConfigureAwait(false);
+			// 硬链接部署时，data 里这份和库里的源是同一个文件，内容必然相同——校验读源即可。
+			// 好处是调用方能把源文件的哈希缓存起来（源在规划阶段已经算过），不必每次把几 GB 重读一遍；
+			// 同时"源被改过"依然能发现，因为比对的还是当前内容。
+			var hashPath = actualPatch.Path;
+			if (entry.Method == DeploymentMethod.HardLink
+				&& !string.IsNullOrWhiteSpace(entry.SourcePath)
+				&& FileIdentity.AreSameFile(actualPatch.Path, entry.SourcePath) == true)
+			{
+				hashPath = entry.SourcePath;
+			}
+			var actualHash = contentHasher is null
+				? await ComputeSha256Async(hashPath, cancellationToken).ConfigureAwait(false)
+				: await contentHasher(hashPath, cancellationToken).ConfigureAwait(false);
 			if (!string.Equals(actualHash, entry.ContentSha256, StringComparison.OrdinalIgnoreCase))
 			{
 				issues.Add(new CoreIssue(
