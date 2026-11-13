@@ -52,13 +52,18 @@ internal sealed class CliManagedDeploymentTransaction : IAsyncDisposable
 		}
 
 		var gameData = Path.GetFullPath(ownership.GameDataDirectory);
+		// 目标已经是想要的那份硬链接时，执行器既不删也不重建它，事务就不该把它算进"受控目标"——
+		// 否则回滚会先删掉它、却没有对应备份可以还原。备份集同理，只留真正会被改动的那些。
+		var unchangedTargets = FindUnchangedTargets(gameData, operations);
 		var controlledTargets = operations
 			.Where(operation => operation.Kind is ApplyOperationKind.DeletePatch or ApplyOperationKind.DeployPatch)
 			.Select(operation => TryNormalizeSafePatchTarget(gameData, operation.TargetPath))
 			.Where(path => path is not null)
 			.Cast<string>()
+			.Where(path => !unchangedTargets.Contains(path))
 			.Distinct(StringComparer.OrdinalIgnoreCase)
 			.ToArray();
+		var controlledTargetSet = new HashSet<string>(controlledTargets, StringComparer.OrdinalIgnoreCase);
 		var statePath = Path.Combine(gameData, JsonActivationStateStore.StateFileName);
 		var stateExisted = File.Exists(statePath);
 		byte[]? stateBytes = null;
@@ -79,7 +84,6 @@ internal sealed class CliManagedDeploymentTransaction : IAsyncDisposable
 		var backups = new List<PatchBackup>();
 		try
 		{
-			Directory.CreateDirectory(backupDirectory);
 			var index = 0;
 			foreach (var file in ownership.SafeDeletionTargets)
 			{
@@ -87,10 +91,24 @@ internal sealed class CliManagedDeploymentTransaction : IAsyncDisposable
 				var source = TryNormalizeSafePatchTarget(gameData, file.TargetPath);
 				if (source is null || !PathExistsIncludingReparsePoint(source) || Directory.Exists(source))
 					throw new CliUserException("ManagedPatchChanged", $"部署开始前已管理 Patch 不再是可安全移动的普通文件：{file.TargetPath}");
+				// 本次不会碰的文件不搬：搬走会让执行器以为它丢了，反而触发一次全量重建。
+				if (!controlledTargetSet.Contains(source))
+					continue;
+				if (backups.Count == 0)
+					Directory.CreateDirectory(backupDirectory);
 				var destination = Path.Combine(backupDirectory, index++.ToString("D6", System.Globalization.CultureInfo.InvariantCulture) + ".patch");
 				File.Move(source, destination, overwrite: false);
 				backups.Add(new PatchBackup(source, destination));
 			}
+
+			if (backups.Count == 0)
+			{
+				// 没有任何文件需要备份（典型情况：只追加了新 mod，旧 Patch 位置没变），
+				// 就别留一个空事务目录。
+				TryDeleteDirectory(transactionDirectory);
+				return new CliManagedDeploymentTransaction(gameData, null, [], controlledTargets, statePath, stateExisted, stateBytes);
+			}
+
 			return new CliManagedDeploymentTransaction(gameData, transactionDirectory, backups, controlledTargets, statePath, stateExisted, stateBytes);
 		}
 		catch
@@ -244,6 +262,22 @@ internal sealed class CliManagedDeploymentTransaction : IAsyncDisposable
 	{
 		if (string.IsNullOrWhiteSpace(path)) return;
 		try { if (Directory.Exists(path)) Directory.Delete(path, recursive: true); } catch { }
+	}
+
+	// 本次部署里"目标已经是想要的那份文件"的集合：执行器会跳过它们，事务也不该动它们。
+	// 判定走文件 ID，不读内容；判定不出来时按"会动"处理，与改动前一致。
+	private static HashSet<string> FindUnchangedTargets(string gameData, IReadOnlyList<ApplyOperation> operations)
+	{
+		var unchanged = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		foreach (var operation in operations)
+		{
+			if (operation.Kind != ApplyOperationKind.DeployPatch) continue;
+			if (string.IsNullOrWhiteSpace(operation.SourcePath)) continue;
+			var target = TryNormalizeSafePatchTarget(gameData, operation.TargetPath);
+			if (target is null) continue;
+			if (FileIdentity.AreSameFile(target, operation.SourcePath) == true) unchanged.Add(target);
+		}
+		return unchanged;
 	}
 
 	private sealed record PatchBackup(string OriginalPath, string BackupPath);
