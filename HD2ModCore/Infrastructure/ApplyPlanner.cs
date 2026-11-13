@@ -53,19 +53,9 @@ public sealed class ApplyPlanner : IApplyPlanner
 		var mappings = new List<DeploymentPatchMapping>();
 		var issues = new List<CoreIssue>(patchIndex.Issues);
 
-		foreach (var existing in EnumerateExistingPatchFiles(gameData))
-		{
-			cancellationToken.ThrowIfCancellationRequested();
-			ops.Add(new ApplyOperation(
-				ApplyOperationKind.DeletePatch,
-				TargetPath: existing,
-				SourcePath: null,
-				ArchiveHex16: null,
-				SourcePatchIndex: null,
-				TargetPatchIndex: null,
-				SidecarKind: null,
-				NodeId: null));
-		}
+		// 删除操作推迟到映射算完之后再生成：只有"目标位置已经不是想要的那个文件"才需要先删。
+		// 目标已经是同一源的硬链接时，删了再建是纯浪费——那正是增量部署要跳过的部分。
+		var deployOps = new List<ApplyOperation>();
 
 		var nextIndexByHex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 		var plannedGroups = new List<PlannedPatchGroup>();
@@ -177,7 +167,7 @@ public sealed class ApplyPlanner : IApplyPlanner
 					targetPatchIndex,
 					file.SidecarKind);
 				mappings.Add(mapping);
-				ops.Add(new ApplyOperation(
+				deployOps.Add(new ApplyOperation(
 					ApplyOperationKind.DeployPatch,
 					mapping.TargetPath,
 					mapping.SourcePath,
@@ -189,6 +179,39 @@ public sealed class ApplyPlanner : IApplyPlanner
 			}
 			nextIndexByHex[archive] = targetPatchIndex + 1;
 		}
+
+		// 增量部署：目标位置已经是指向同一源文件的硬链接时，既不必删除也不必重建，
+		// 这里连 DeletePatch 都不发，免得下游把它当成"要动的文件"去做备份与回收。
+		// 判定用文件 ID（不读内容），跨卷或无法判定时一律按"需要删除"处理，行为与改动前一致。
+		var alreadyLinked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		foreach (var mapping in mappings)
+		{
+			cancellationToken.ThrowIfCancellationRequested();
+			if (FileIdentity.AreSameFile(mapping.TargetPath, mapping.SourcePath) == true)
+			{
+				alreadyLinked.Add(Path.GetFullPath(mapping.TargetPath));
+			}
+		}
+
+		foreach (var existing in EnumerateExistingPatchFiles(gameData))
+		{
+			cancellationToken.ThrowIfCancellationRequested();
+			if (alreadyLinked.Contains(Path.GetFullPath(existing)))
+			{
+				continue;
+			}
+			ops.Add(new ApplyOperation(
+				ApplyOperationKind.DeletePatch,
+				TargetPath: existing,
+				SourcePath: null,
+				ArchiveHex16: null,
+				SourcePatchIndex: null,
+				TargetPatchIndex: null,
+				SidecarKind: null,
+				NodeId: null));
+		}
+
+		ops.AddRange(deployOps);
 
 		return ValueTask.FromResult(new ApplyPlan(gameData, profile.Id, profile.Revision, DateTimeOffset.UtcNow, ops, issues)
 		{
