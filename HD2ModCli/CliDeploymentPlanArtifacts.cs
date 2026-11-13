@@ -237,14 +237,17 @@ internal static class CliDeploymentPlanArtifacts
 			.SelectMany(group => group.Files)
 			.ToDictionary(file => Path.GetFullPath(file.FilePath), file => file, StringComparer.OrdinalIgnoreCase);
 		var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-		var patches = await CreatePatchProjectionsAsync(deploymentPlan, generatedFiles, hashes, diagnostics, cancellationToken).ConfigureAwait(false);
+		var hashCache = CliPatchHashCache.Load(workspace.ManagerRoot);
+		var patches = await CreatePatchProjectionsAsync(deploymentPlan, generatedFiles, hashes, hashCache, diagnostics, cancellationToken).ConfigureAwait(false);
 		var inputFingerprint = await ComputeInputFingerprintAsync(
 			effective,
 			originalIndex,
 			activeNodeIds,
 			luaPlan.ExternalFiles,
 			hashes,
+			hashCache,
 			cancellationToken).ConfigureAwait(false);
+		await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
 		var externalFiles = luaPlan.ExternalFiles
 			.OrderBy(mapping => mapping.TargetPath, StringComparer.OrdinalIgnoreCase)
 			.Select(mapping => new CliDeploymentExternalFile(
@@ -414,7 +417,9 @@ internal static class CliDeploymentPlanArtifacts
 			.SelectMany(group => group.Files)
 			.ToDictionary(file => Path.GetFullPath(file.FilePath), file => file, StringComparer.OrdinalIgnoreCase);
 		var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-		var patches = await CreatePatchProjectionsAsync(plan, generatedFiles, hashes, diagnostics, cancellationToken).ConfigureAwait(false);
+		var hashCache = CliPatchHashCache.Load(current.Document.Target.ManagerRoot);
+		var patches = await CreatePatchProjectionsAsync(plan, generatedFiles, hashes, hashCache, diagnostics, cancellationToken).ConfigureAwait(false);
+		await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
 		var externalFiles = preparation.ExternalFiles
 			.OrderBy(mapping => mapping.TargetPath, StringComparer.OrdinalIgnoreCase)
 			.Select(mapping => new CliDeploymentExternalFile(
@@ -493,6 +498,7 @@ internal static class CliDeploymentPlanArtifacts
 		ApplyPlan plan,
 		IReadOnlyDictionary<string, GeneratedPatchFile> generatedFiles,
 		IDictionary<string, string> hashes,
+		CliPatchHashCache hashCache,
 		ICollection<CliDeploymentDiagnostic> diagnostics,
 		CancellationToken cancellationToken)
 	{
@@ -527,7 +533,7 @@ internal static class CliDeploymentPlanArtifacts
 					var info = new FileInfo(sourcePath);
 					if (!info.Exists) throw new FileNotFoundException("部署来源 Patch 不存在。", sourcePath);
 					length = info.Length;
-					hash = await GetHashAsync(sourcePath, hashes, cancellationToken).ConfigureAwait(false);
+					hash = await GetHashAsync(sourcePath, hashes, hashCache, cancellationToken).ConfigureAwait(false);
 				}
 				catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or FileNotFoundException)
 				{
@@ -556,6 +562,7 @@ internal static class CliDeploymentPlanArtifacts
 		IReadOnlySet<ModNodeId> activeNodeIds,
 		IReadOnlyList<ExternalFileMapping> externalFiles,
 		IDictionary<string, string> hashes,
+		CliPatchHashCache hashCache,
 		CancellationToken cancellationToken)
 	{
 		using var builder = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -573,7 +580,7 @@ internal static class CliDeploymentPlanArtifacts
 			AppendField(builder, file.ArchiveHex16);
 			AppendField(builder, file.SourcePatchIndex.ToString(System.Globalization.CultureInfo.InvariantCulture));
 			AppendField(builder, ((int)file.SidecarKind).ToString(System.Globalization.CultureInfo.InvariantCulture));
-			AppendField(builder, await GetHashAsync(file.FilePath, hashes, cancellationToken).ConfigureAwait(false));
+			AppendField(builder, await GetHashAsync(file.FilePath, hashes, hashCache, cancellationToken).ConfigureAwait(false));
 		}
 		foreach (var external in externalFiles.OrderBy(file => file.TargetPath, StringComparer.OrdinalIgnoreCase))
 		{
@@ -584,12 +591,12 @@ internal static class CliDeploymentPlanArtifacts
 		return Convert.ToHexString(builder.GetHashAndReset()).ToLowerInvariant();
 	}
 
-	private static async ValueTask<string> GetHashAsync(string path, IDictionary<string, string> hashes, CancellationToken cancellationToken)
+	private static async ValueTask<string> GetHashAsync(string path, IDictionary<string, string> hashes, CliPatchHashCache cache, CancellationToken cancellationToken)
 	{
 		var fullPath = Path.GetFullPath(path);
+		// 先看本次运行的备忘，再看跨进程的磁盘缓存：只有两边都没有才真读文件。
 		if (hashes.TryGetValue(fullPath, out var cached)) return cached;
-		await using var stream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-		var hash = Convert.ToHexString(await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false)).ToLowerInvariant();
+		var hash = await cache.GetOrComputeAsync(fullPath, cancellationToken).ConfigureAwait(false);
 		hashes[fullPath] = hash;
 		return hash;
 	}
