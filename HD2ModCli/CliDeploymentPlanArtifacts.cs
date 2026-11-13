@@ -179,8 +179,14 @@ internal static class CliDeploymentPlanArtifacts
 			return CreateIncompleteResult(target, profileProjection, incompleteOwnership, diagnostics);
 		}
 
+		// 哈希缓存先建好：所有权校验要按内容证明"data 里这份还是我们部署的那份"，
+		// 而硬链接部署时它读的就是库里的源文件——同一份缓存能跨命令复用。
+		var hashCache = CliPatchHashCache.Load(workspace.ManagerRoot);
 		var ownershipInspection = await CoreServices.CreateDeploymentOwnershipInspector()
-			.InspectAsync(targetValidation.GameDataDirectory, cancellationToken)
+			.InspectAsync(
+				targetValidation.GameDataDirectory,
+				cancellationToken,
+				(path, token) => hashCache.GetOrComputeAsync(path, token))
 			.ConfigureAwait(false);
 		AddCoreIssues(diagnostics, ownershipInspection.Issues, "ownership");
 		var ownership = new CliDeploymentOwnership(
@@ -237,7 +243,6 @@ internal static class CliDeploymentPlanArtifacts
 			.SelectMany(group => group.Files)
 			.ToDictionary(file => Path.GetFullPath(file.FilePath), file => file, StringComparer.OrdinalIgnoreCase);
 		var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-		var hashCache = CliPatchHashCache.Load(workspace.ManagerRoot);
 		var patches = await CreatePatchProjectionsAsync(deploymentPlan, generatedFiles, hashes, hashCache, diagnostics, cancellationToken).ConfigureAwait(false);
 		var inputFingerprint = await ComputeInputFingerprintAsync(
 			effective,

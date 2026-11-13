@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using HD2ModCore.Domain;
@@ -243,6 +244,60 @@ public sealed class DeploymentOwnershipInspectorTests
 		Assert.Equal(DeploymentOwnershipStatus.Managed, result.Status);
 		Assert.True(Assert.Single(result.ActualPatches).IsReparsePoint);
 	}
+
+	// 作用：硬链接部署时，内容校验读的是库里的源文件（和 data 里那份是同一个文件），
+	// 这样调用方能把哈希缓存起来，不必每次把几 GB 重读一遍。
+	[Fact]
+	public async Task InspectAsync_HardLinkEntry_VerifiesThroughSourcePath()
+	{
+		using var fixture = new GameDataFixture();
+		var sourceDirectory = Path.Combine(fixture.RootDirectory, "mods", "mod");
+		Directory.CreateDirectory(sourceDirectory);
+		var sourcePath = Path.Combine(sourceDirectory, "0123456789abcdef.patch_0");
+		await File.WriteAllTextAsync(sourcePath, "PATCH");
+
+		var targetPath = Path.Combine(fixture.GameDataDirectory, "0123456789abcdef.patch_0");
+		Assert.True(TryCreateHardLink(targetPath, sourcePath), "无法在测试环境创建硬链接");
+
+		var content = "PATCH";
+		var entry = new ActivationStateFileEntry(
+			targetPath,
+			sourcePath,
+			DeploymentMethod.HardLink,
+			"0123456789abcdef",
+			0,
+			0,
+			PatchSidecarKind.Base,
+			ModNodeId.New(),
+			Encoding.UTF8.GetByteCount(content),
+			ToSha256(content));
+		await fixture.SaveStateAsync(fixture.StateFor(entry));
+
+		var hashedPaths = new List<string>();
+		var result = await new DeploymentOwnershipInspector().InspectAsync(
+			fixture.GameDataDirectory,
+			CancellationToken.None,
+			(path, _) =>
+			{
+				hashedPaths.Add(Path.GetFullPath(path));
+				return ValueTask.FromResult(ToSha256(content));
+			});
+
+		Assert.Equal(DeploymentOwnershipStatus.Managed, result.Status);
+		Assert.DoesNotContain(result.Issues, issue => issue.Severity == CoreIssueSeverity.Error);
+		// 校验对象换成了源文件：同一份内容，但缓存能命中。
+		Assert.Contains(Path.GetFullPath(sourcePath), hashedPaths);
+		Assert.DoesNotContain(Path.GetFullPath(targetPath), hashedPaths);
+	}
+
+	private static string ToSha256(string content)
+		=> Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(content))).ToLowerInvariant();
+
+	[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+	private static extern bool CreateHardLinkW(string linkPath, string existingPath, IntPtr securityAttributes);
+
+	private static bool TryCreateHardLink(string linkPath, string existingPath)
+		=> OperatingSystem.IsWindows() && CreateHardLinkW(linkPath, existingPath, IntPtr.Zero);
 
 	private sealed class GameDataFixture : IDisposable
 	{
