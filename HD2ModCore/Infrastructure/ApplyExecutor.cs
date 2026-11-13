@@ -33,7 +33,10 @@ public sealed class ApplyExecutor : IApplyExecutor
 		_activationStateStore = activationStateStore ?? throw new ArgumentNullException(nameof(activationStateStore));
 	}
 
-	public async ValueTask<ApplyResult> ExecuteAsync(ApplyPlan plan, CancellationToken cancellationToken = default)
+	public async ValueTask<ApplyResult> ExecuteAsync(
+		ApplyPlan plan,
+		CancellationToken cancellationToken = default,
+		Func<string, CancellationToken, ValueTask<string>>? contentHasher = null)
 	{
 		ArgumentNullException.ThrowIfNull(plan);
 		Directory.CreateDirectory(plan.GameDataDirectory);
@@ -52,7 +55,7 @@ public sealed class ApplyExecutor : IApplyExecutor
 			issues.Add(new CoreIssue(CoreIssueSeverity.Error, "ReadActivationStateFailed", exception.Message, Path.Combine(plan.GameDataDirectory, JsonActivationStateStore.StateFileName), ExceptionMessage: exception.ToString()));
 			return new ApplyResult(false, operationResults, await _stateScanner.ScanAsync(plan.GameDataDirectory, false, CancellationToken.None).ConfigureAwait(false), issues);
 		}
-		var preflight = await PreflightAsync(plan.GameDataDirectory, deployOperations, externalDeployMappings, previousState?.ExternalFiles ?? Array.Empty<ExternalFileMapping>(), plan.UseFastLinkValidation, cancellationToken).ConfigureAwait(false);
+		var preflight = await PreflightAsync(plan.GameDataDirectory, deployOperations, externalDeployMappings, previousState?.ExternalFiles ?? Array.Empty<ExternalFileMapping>(), plan.UseFastLinkValidation, cancellationToken, contentHasher).ConfigureAwait(false);
 		issues.AddRange(preflight.Issues);
 		if (preflight.Issues.Any(issue => issue.Severity == CoreIssueSeverity.Error))
 		{
@@ -132,7 +135,7 @@ public sealed class ApplyExecutor : IApplyExecutor
 
 		var report = await _stateScanner.ScanAsync(plan.GameDataDirectory, recursive: false, CancellationToken.None).ConfigureAwait(false);
 		issues.AddRange(report.Issues);
-		issues.AddRange(await VerifyDeployedFilesAsync(deployed, plan.UseFastLinkValidation).ConfigureAwait(false));
+		issues.AddRange(await VerifyDeployedFilesAsync(deployed, plan.UseFastLinkValidation, contentHasher).ConfigureAwait(false));
 		issues.AddRange(await VerifyExternalFilesAsync(deployedExternal).ConfigureAwait(false));
 		if (issues.Any(issue => issue.Severity == CoreIssueSeverity.Error))
 		{
@@ -263,7 +266,8 @@ public sealed class ApplyExecutor : IApplyExecutor
 		IReadOnlyList<ExternalFileMapping> externalMappings,
 		IReadOnlyList<ExternalFileMapping> previousExternalMappings,
 		bool useFastLinkValidation,
-		CancellationToken cancellationToken)
+		CancellationToken cancellationToken,
+		Func<string, CancellationToken, ValueTask<string>>? contentHasher = null)
 	{
 		var issues = new List<CoreIssue>();
 		var sources = new Dictionary<string, SourceFileFact>(StringComparer.OrdinalIgnoreCase);
@@ -291,7 +295,9 @@ public sealed class ApplyExecutor : IApplyExecutor
 				}
 				var sha256 = useFastLinkValidation
 					? string.Empty
-					: await ComputeSha256Async(operation.SourcePath, cancellationToken).ConfigureAwait(false);
+					: contentHasher is null
+						? await ComputeSha256Async(operation.SourcePath, cancellationToken).ConfigureAwait(false)
+						: await contentHasher(operation.SourcePath, cancellationToken).ConfigureAwait(false);
 				sources[operation.SourcePath] = new SourceFileFact(info.Length, sha256);
 			}
 			catch (Exception exception) when (exception is not OperationCanceledException)
@@ -669,7 +675,10 @@ public sealed class ApplyExecutor : IApplyExecutor
 			throw new IOException("The external target path exists but is not a regular file.");
 	}
 
-	private static async ValueTask<IReadOnlyList<CoreIssue>> VerifyDeployedFilesAsync(IReadOnlyList<ActivationStateFileEntry> files, bool useFastLinkValidation)
+	private static async ValueTask<IReadOnlyList<CoreIssue>> VerifyDeployedFilesAsync(
+		IReadOnlyList<ActivationStateFileEntry> files,
+		bool useFastLinkValidation,
+		Func<string, CancellationToken, ValueTask<string>>? contentHasher = null)
 	{
 		var issues = new List<CoreIssue>();
 		foreach (var file in files)
@@ -697,7 +706,18 @@ public sealed class ApplyExecutor : IApplyExecutor
 			}
 			try
 			{
-				var hash = await ComputeSha256Async(file.TargetPath, CancellationToken.None).ConfigureAwait(false);
+				// 硬链接时目标就是源本身，校验读源即可——内容必然相同，而且调用方能把源哈希缓存起来。
+				// 判定不出来（跨卷、源已删）就退回读目标。
+				var hashPath = file.TargetPath;
+				if (file.Method == DeploymentMethod.HardLink
+					&& !string.IsNullOrWhiteSpace(file.SourcePath)
+					&& FileIdentity.AreSameFile(file.TargetPath, file.SourcePath) == true)
+				{
+					hashPath = file.SourcePath;
+				}
+				var hash = contentHasher is null
+					? await ComputeSha256Async(hashPath, CancellationToken.None).ConfigureAwait(false)
+					: await contentHasher(hashPath, CancellationToken.None).ConfigureAwait(false);
 				if (!string.Equals(hash, file.ContentSha256, StringComparison.OrdinalIgnoreCase))
 					issues.Add(new CoreIssue(CoreIssueSeverity.Error, "DeployedHashMismatch", "Deployed target content differs from its recorded source hash.", file.TargetPath, file.NodeId));
 			}

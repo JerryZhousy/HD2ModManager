@@ -158,7 +158,7 @@ public sealed class ProfileDeploymentCoordinatorTests
 	private sealed class RecordingExecutor : IApplyExecutor
 	{
 		public int DeactivateCount { get; private set; }
-		public ValueTask<ApplyResult> ExecuteAsync(ApplyPlan plan, CancellationToken cancellationToken = default) => ValueTask.FromResult(new ApplyResult(true, [], null, []));
+		public ValueTask<ApplyResult> ExecuteAsync(ApplyPlan plan, CancellationToken cancellationToken = default, Func<string, CancellationToken, ValueTask<string>>? contentHasher = null) => ValueTask.FromResult(new ApplyResult(true, [], null, []));
 		public ValueTask<ApplyResult> DeactivateAsync(string gameDataDirectory, CancellationToken cancellationToken = default)
 		{
 			DeactivateCount++;
@@ -171,7 +171,7 @@ public sealed class ProfileDeploymentCoordinatorTests
 		private readonly TaskCompletionSource _deactivateCalled = new(TaskCreationOptions.RunContinuationsAsynchronously);
 		private readonly TaskCompletionSource _completeDeactivate = new(TaskCreationOptions.RunContinuationsAsynchronously);
 		public int DeactivateCount { get; private set; }
-		public ValueTask<ApplyResult> ExecuteAsync(ApplyPlan plan, CancellationToken cancellationToken = default) => ValueTask.FromResult(new ApplyResult(true, [], null, []));
+		public ValueTask<ApplyResult> ExecuteAsync(ApplyPlan plan, CancellationToken cancellationToken = default, Func<string, CancellationToken, ValueTask<string>>? contentHasher = null) => ValueTask.FromResult(new ApplyResult(true, [], null, []));
 		public async ValueTask<ApplyResult> DeactivateAsync(string gameDataDirectory, CancellationToken cancellationToken = default)
 		{
 			DeactivateCount++;
