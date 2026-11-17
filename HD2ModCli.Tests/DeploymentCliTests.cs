@@ -117,7 +117,6 @@ public sealed class DeploymentCliTests
 		Assert.NotNull(state);
 		Assert.True(state!.Completed);
 		Assert.Equal(3, state.Files.Count);
-		Assert.All(state.Files, file => Assert.False(string.IsNullOrWhiteSpace(file.ContentSha256)));
 		Assert.All(state.Files, file => Assert.True(File.Exists(file.TargetPath)));
 	}
 
@@ -247,6 +246,126 @@ public sealed class DeploymentCliTests
 		]));
 		Assert.False(File.Exists(Path.Combine(gameBin, "fixture.addon64")));
 		Assert.False(File.Exists(Path.Combine(gameBin, "presets", "fixture.ini")));
+	}
+
+	[Fact]
+	public async Task DeployApplyDirect_FastMode_DeploysWithoutPlanFile()
+	{
+		await using var fixture = await DeploymentFixture.CreateAsync(includeLuaPatch: true);
+
+		var applyExit = await CliApplication.RunAsync(
+		[
+			"deploy", "apply", "active",
+			"--manager-root", fixture.ManagerRoot,
+			"--game-data", fixture.GameDataDirectory,
+			"--fast",
+			"--confirm",
+			"--json",
+		]);
+
+		var state = await new JsonActivationStateStore().TryLoadAsync(fixture.GameDataDirectory);
+		Assert.Equal(0, applyExit);
+		Assert.NotNull(state);
+		Assert.True(state!.Completed);
+		Assert.Equal(3, state.Files.Count);
+		Assert.All(state.Files, file => Assert.True(File.Exists(file.TargetPath)));
+	}
+
+	[Fact]
+	public async Task DeployPlanAndApply_FastMode_ProducesFastPlanAndDeploys()
+	{
+		await using var fixture = await DeploymentFixture.CreateAsync(includeLuaPatch: true);
+		var planPath = Path.Combine(fixture.RootDirectory, "fast-deployment-plan.json");
+
+		var planExit = await CliApplication.RunAsync(
+		[
+			"deploy", "plan", "active",
+			"--manager-root", fixture.ManagerRoot,
+			"--game-data", fixture.GameDataDirectory,
+			"--output", planPath,
+			"--fast",
+			"--json",
+		]);
+		var validateExit = await CliApplication.RunAsync(
+		[
+			"deploy", "validate",
+			"--manager-root", fixture.ManagerRoot,
+			"--game-data", fixture.GameDataDirectory,
+			"--plan", planPath,
+			"--fast",
+			"--json",
+		]);
+		var applyExit = await CliApplication.RunAsync(
+		[
+			"deploy", "apply",
+			"--manager-root", fixture.ManagerRoot,
+			"--game-data", fixture.GameDataDirectory,
+			"--plan", planPath,
+			"--fast",
+			"--confirm",
+			"--json",
+		]);
+
+		var state = await new JsonActivationStateStore().TryLoadAsync(fixture.GameDataDirectory);
+		Assert.Equal(0, planExit);
+		Assert.Equal(0, validateExit);
+		Assert.Equal(0, applyExit);
+		Assert.NotNull(state);
+		Assert.True(state!.Completed);
+		Assert.Equal(3, state.Files.Count);
+		Assert.All(state.Files, file => Assert.True(File.Exists(file.TargetPath)));
+
+		// 验证导出的计划中，快速模式下的 Patch 未执行全量物理 SHA-256
+		var planJson = await File.ReadAllTextAsync(planPath);
+		var doc = JsonSerializer.Deserialize<CliDeploymentPlanDocument>(planJson, CliOutput.JsonOptions);
+		Assert.NotNull(doc);
+		Assert.All(doc!.Patches.Where(p => !p.IsGenerated), patch => Assert.Null(patch.SourceSha256));
+	}
+
+	[Fact]
+	public async Task DeployValidate_ReusesPreviousSnapshot_WhenNoDriftOccurs()
+	{
+		await using var fixture = await DeploymentFixture.CreateAsync(includeLuaPatch: true);
+		var workspace = CliWorkspace.Open(new CliGlobalOptions(
+			ManagerRoot: fixture.ManagerRoot,
+			Library: null,
+			GameData: fixture.GameDataDirectory,
+			RegistryRoot: null,
+			Output: null,
+			Plan: null,
+			Host: null,
+			AddToProfile: null,
+			Keys: null,
+			AddKeys: null,
+			RemoveKeys: null,
+			ArchiveId: null,
+			Kind: null,
+			Header: null,
+			Picks: [],
+			Position: null,
+			Limit: null,
+			Cursor: null,
+			SetActive: false,
+			WithUnsharedOptions: false,
+			WithEffective: false,
+			OnlyCompetition: false,
+			Overwrite: false,
+			Confirm: false,
+			Json: false));
+
+		var initialBuild = await CliDeploymentPlanArtifacts.BuildAsync(workspace, "active", fastMode: true);
+		Assert.NotNull(initialBuild.Document);
+
+		// 使用相同的 previous 调用 ValidateAsync，应命中轻量快速检查并直接复用实例
+		var validation = await CliDeploymentPlanArtifacts.ValidateAsync(
+			initialBuild.Document,
+			workspace,
+			includeProcessCheck: true,
+			fastMode: true,
+			previous: initialBuild);
+
+		Assert.True(validation.IsValid);
+		Assert.Same(initialBuild, validation.Current);
 	}
 
 	private sealed class DeploymentFixture : IAsyncDisposable

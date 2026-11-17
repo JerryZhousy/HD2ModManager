@@ -99,7 +99,12 @@ internal sealed record CliDeploymentBuildResult(
 	PatchFileIndex? ActivePatchIndex,
 	IReadOnlyDictionary<ModNodeId, ModContentFacts> ContentFacts,
 	LuaDeploymentPlan? LuaPlan,
-	DeploymentOwnershipInspection? OwnershipInspection);
+	DeploymentOwnershipInspection? OwnershipInspection,
+	DateTime? LibraryWriteTimeUtc = null,
+	long LibraryLength = 0,
+	DateTime? OptionActivationsWriteTimeUtc = null,
+	DateTime? ActivationStateWriteTimeUtc = null,
+	long ActivationStateLength = 0);
 
 internal sealed record CliDeploymentValidationResult(
 	CliDeploymentPlanDocument Document,
@@ -125,16 +130,31 @@ internal static class CliDeploymentPlanArtifacts
 		CliWorkspace workspace,
 		string? profileSelector,
 		CancellationToken cancellationToken = default)
+		=> await BuildAsync(workspace, profileSelector, fastMode: false, cancellationToken).ConfigureAwait(false);
+
+	public static async ValueTask<CliDeploymentBuildResult> BuildAsync(
+		CliWorkspace workspace,
+		string? profileSelector,
+		bool fastMode,
+		CancellationToken cancellationToken = default)
 	{
 		ArgumentNullException.ThrowIfNull(workspace);
 		var state = await workspace.LoadLibraryAsync(cancellationToken).ConfigureAwait(false);
-		return await BuildAsync(workspace, state, profileSelector, cancellationToken).ConfigureAwait(false);
+		return await BuildAsync(workspace, state, profileSelector, fastMode, cancellationToken).ConfigureAwait(false);
 	}
 
 	public static async ValueTask<CliDeploymentBuildResult> BuildAsync(
 		CliWorkspace workspace,
 		CliLibraryState libraryState,
 		string? profileSelector,
+		CancellationToken cancellationToken = default)
+		=> await BuildAsync(workspace, libraryState, profileSelector, fastMode: false, cancellationToken).ConfigureAwait(false);
+
+	public static async ValueTask<CliDeploymentBuildResult> BuildAsync(
+		CliWorkspace workspace,
+		CliLibraryState libraryState,
+		string? profileSelector,
+		bool fastMode,
 		CancellationToken cancellationToken = default)
 	{
 		ArgumentNullException.ThrowIfNull(workspace);
@@ -186,7 +206,7 @@ internal static class CliDeploymentPlanArtifacts
 			.InspectAsync(
 				targetValidation.GameDataDirectory,
 				cancellationToken,
-				(path, token) => hashCache.GetOrComputeAsync(path, token))
+				fastMode ? null : (path, token) => hashCache.GetOrComputeAsync(path, token))
 			.ConfigureAwait(false);
 		AddCoreIssues(diagnostics, ownershipInspection.Issues, "ownership");
 		var ownership = new CliDeploymentOwnership(
@@ -243,7 +263,7 @@ internal static class CliDeploymentPlanArtifacts
 			.SelectMany(group => group.Files)
 			.ToDictionary(file => Path.GetFullPath(file.FilePath), file => file, StringComparer.OrdinalIgnoreCase);
 		var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-		var patches = await CreatePatchProjectionsAsync(deploymentPlan, generatedFiles, hashes, hashCache, diagnostics, cancellationToken).ConfigureAwait(false);
+		var patches = await CreatePatchProjectionsAsync(deploymentPlan, generatedFiles, hashes, hashCache, diagnostics, fastMode, cancellationToken).ConfigureAwait(false);
 		var inputFingerprint = await ComputeInputFingerprintAsync(
 			effective,
 			originalIndex,
@@ -251,8 +271,12 @@ internal static class CliDeploymentPlanArtifacts
 			luaPlan.ExternalFiles,
 			hashes,
 			hashCache,
+			fastMode,
 			cancellationToken).ConfigureAwait(false);
-		await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
+		if (!fastMode)
+		{
+			await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
+		}
 		var externalFiles = luaPlan.ExternalFiles
 			.OrderBy(mapping => mapping.TargetPath, StringComparer.OrdinalIgnoreCase)
 			.Select(mapping => new CliDeploymentExternalFile(
@@ -271,7 +295,46 @@ internal static class CliDeploymentPlanArtifacts
 			luaPlan.CompositionFingerprint,
 			patches.Where(patch => patch.IsGenerated).Select(patch => patch.TargetPath).ToArray());
 		var document = CreateDocument(target, profileProjection, ownership, inputFingerprint, patches, externalFiles, lua, diagnostics);
-		return new CliDeploymentBuildResult(document, deploymentPlan, libraryState.Snapshot, effective, originalIndex, filteredIndex, contentFacts, luaPlan, ownershipInspection);
+
+		DateTime? libraryWriteTimeUtc = null;
+		long libraryLength = 0;
+		if (!string.IsNullOrWhiteSpace(workspace.LibraryRoot))
+		{
+			var libraryPath = Path.Combine(workspace.LibraryRoot, "library.json");
+			if (File.Exists(libraryPath))
+			{
+				var info = new FileInfo(libraryPath);
+				libraryWriteTimeUtc = info.LastWriteTimeUtc;
+				libraryLength = info.Length;
+			}
+		}
+
+		DateTime? optionActivationsWriteTimeUtc = null;
+		if (!string.IsNullOrWhiteSpace(workspace.LibraryRoot))
+		{
+			var optPath = Path.Combine(workspace.LibraryRoot, "option-activations.json");
+			if (File.Exists(optPath))
+			{
+				optionActivationsWriteTimeUtc = new FileInfo(optPath).LastWriteTimeUtc;
+			}
+		}
+
+		DateTime? activationStateWriteTimeUtc = null;
+		long activationStateLength = 0;
+		if (!string.IsNullOrWhiteSpace(targetValidation.GameDataDirectory))
+		{
+			var statePath = Path.Combine(targetValidation.GameDataDirectory, JsonActivationStateStore.StateFileName);
+			if (File.Exists(statePath))
+			{
+				var info = new FileInfo(statePath);
+				activationStateWriteTimeUtc = info.LastWriteTimeUtc;
+				activationStateLength = info.Length;
+			}
+		}
+
+		return new CliDeploymentBuildResult(
+			document, deploymentPlan, libraryState.Snapshot, effective, originalIndex, filteredIndex, contentFacts, luaPlan, ownershipInspection,
+			libraryWriteTimeUtc, libraryLength, optionActivationsWriteTimeUtc, activationStateWriteTimeUtc, activationStateLength);
 	}
 
 	public static async ValueTask<CliDeploymentPlanDocument> ReadDocumentAsync(
@@ -323,6 +386,15 @@ internal static class CliDeploymentPlanArtifacts
 		CliWorkspace workspace,
 		bool includeProcessCheck,
 		CancellationToken cancellationToken = default)
+		=> await ValidateAsync(document, workspace, includeProcessCheck, fastMode: false, previous: null, cancellationToken).ConfigureAwait(false);
+
+	public static async ValueTask<CliDeploymentValidationResult> ValidateAsync(
+		CliDeploymentPlanDocument document,
+		CliWorkspace workspace,
+		bool includeProcessCheck,
+		bool fastMode,
+		CliDeploymentBuildResult? previous = null,
+		CancellationToken cancellationToken = default)
 	{
 		ArgumentNullException.ThrowIfNull(document);
 		ArgumentNullException.ThrowIfNull(workspace);
@@ -330,7 +402,15 @@ internal static class CliDeploymentPlanArtifacts
 		CliDeploymentBuildResult? current = null;
 		try
 		{
-			current = await BuildAsync(workspace, document.Profile.Id, cancellationToken).ConfigureAwait(false);
+			if (previous is not null && string.Equals(document.PlanId, previous.Document.PlanId, StringComparison.OrdinalIgnoreCase) && IsPreviousSnapshotValid(previous, workspace))
+			{
+				current = previous;
+			}
+			else
+			{
+				current = await BuildAsync(workspace, document.Profile.Id, fastMode, cancellationToken).ConfigureAwait(false);
+			}
+
 			diagnostics.AddRange(current.Document.Diagnostics);
 			if (!PathsEqual(document.Target.ManagerRoot, current.Document.Target.ManagerRoot)
 				|| !PathsEqual(document.Target.LibraryRoot, current.Document.Target.LibraryRoot)
@@ -372,8 +452,46 @@ internal static class CliDeploymentPlanArtifacts
 		return new CliDeploymentValidationResult(document, current, DistinctDiagnostics(diagnostics));
 	}
 
+	private static bool IsPreviousSnapshotValid(CliDeploymentBuildResult previous, CliWorkspace workspace)
+	{
+		if (string.IsNullOrWhiteSpace(workspace.LibraryRoot)) return false;
+		var libraryPath = Path.Combine(workspace.LibraryRoot, "library.json");
+		if (!File.Exists(libraryPath)) return false;
+		var libInfo = new FileInfo(libraryPath);
+		if (libInfo.Length != previous.LibraryLength || libInfo.LastWriteTimeUtc != previous.LibraryWriteTimeUtc)
+			return false;
+
+		var optPath = Path.Combine(workspace.LibraryRoot, "option-activations.json");
+		if (File.Exists(optPath))
+		{
+			var optInfo = new FileInfo(optPath);
+			if (optInfo.LastWriteTimeUtc != previous.OptionActivationsWriteTimeUtc) return false;
+		}
+		else if (previous.OptionActivationsWriteTimeUtc is not null) return false;
+
+		if (previous.Document.Target.GameDataDirectory is { } gameData && Directory.Exists(gameData))
+		{
+			var statePath = Path.Combine(gameData, JsonActivationStateStore.StateFileName);
+			if (File.Exists(statePath))
+			{
+				var stateInfo = new FileInfo(statePath);
+				if (stateInfo.Length != previous.ActivationStateLength || stateInfo.LastWriteTimeUtc != previous.ActivationStateWriteTimeUtc)
+					return false;
+			}
+			else if (previous.ActivationStateWriteTimeUtc is not null) return false;
+		}
+
+		return true;
+	}
+
 	public static async ValueTask<CliDeploymentMaterializedPlan> MaterializeAsync(
 		CliDeploymentBuildResult current,
+		CancellationToken cancellationToken = default)
+		=> await MaterializeAsync(current, fastMode: false, cancellationToken).ConfigureAwait(false);
+
+	public static async ValueTask<CliDeploymentMaterializedPlan> MaterializeAsync(
+		CliDeploymentBuildResult current,
+		bool fastMode,
 		CancellationToken cancellationToken = default)
 	{
 		ArgumentNullException.ThrowIfNull(current);
@@ -423,8 +541,11 @@ internal static class CliDeploymentPlanArtifacts
 			.ToDictionary(file => Path.GetFullPath(file.FilePath), file => file, StringComparer.OrdinalIgnoreCase);
 		var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 		var hashCache = CliPatchHashCache.Load(current.Document.Target.ManagerRoot);
-		var patches = await CreatePatchProjectionsAsync(plan, generatedFiles, hashes, hashCache, diagnostics, cancellationToken).ConfigureAwait(false);
-		await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
+		var patches = await CreatePatchProjectionsAsync(plan, generatedFiles, hashes, hashCache, diagnostics, fastMode, cancellationToken).ConfigureAwait(false);
+		if (!fastMode)
+		{
+			await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
+		}
 		var externalFiles = preparation.ExternalFiles
 			.OrderBy(mapping => mapping.TargetPath, StringComparer.OrdinalIgnoreCase)
 			.Select(mapping => new CliDeploymentExternalFile(
@@ -505,6 +626,7 @@ internal static class CliDeploymentPlanArtifacts
 		IDictionary<string, string> hashes,
 		CliPatchHashCache hashCache,
 		ICollection<CliDeploymentDiagnostic> diagnostics,
+		bool fastMode,
 		CancellationToken cancellationToken)
 	{
 		var patches = new List<CliDeploymentPatch>();
@@ -538,7 +660,9 @@ internal static class CliDeploymentPlanArtifacts
 					var info = new FileInfo(sourcePath);
 					if (!info.Exists) throw new FileNotFoundException("部署来源 Patch 不存在。", sourcePath);
 					length = info.Length;
-					hash = await GetHashAsync(sourcePath, hashes, hashCache, cancellationToken).ConfigureAwait(false);
+					hash = fastMode
+						? null
+						: await GetHashAsync(sourcePath, hashes, hashCache, cancellationToken).ConfigureAwait(false);
 				}
 				catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or FileNotFoundException)
 				{
@@ -568,10 +692,11 @@ internal static class CliDeploymentPlanArtifacts
 		IReadOnlyList<ExternalFileMapping> externalFiles,
 		IDictionary<string, string> hashes,
 		CliPatchHashCache hashCache,
+		bool fastMode,
 		CancellationToken cancellationToken)
 	{
 		using var builder = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-		AppendField(builder, "hd2mod-deployment-input-v1");
+		AppendField(builder, fastMode ? "hd2mod-deployment-input-v1-fast" : "hd2mod-deployment-input-v1");
 		foreach (var entry in effectiveProfile.Entries)
 			AppendField(builder, entry.NodeId.Value.ToString("N"));
 		foreach (var file in index.FilesByNode
@@ -585,7 +710,15 @@ internal static class CliDeploymentPlanArtifacts
 			AppendField(builder, file.ArchiveHex16);
 			AppendField(builder, file.SourcePatchIndex.ToString(System.Globalization.CultureInfo.InvariantCulture));
 			AppendField(builder, ((int)file.SidecarKind).ToString(System.Globalization.CultureInfo.InvariantCulture));
-			AppendField(builder, await GetHashAsync(file.FilePath, hashes, hashCache, cancellationToken).ConfigureAwait(false));
+			if (fastMode)
+			{
+				var info = new FileInfo(file.FilePath);
+				AppendField(builder, info.Exists ? $"{info.Length}:{info.LastWriteTimeUtc.Ticks}" : "missing");
+			}
+			else
+			{
+				AppendField(builder, await GetHashAsync(file.FilePath, hashes, hashCache, cancellationToken).ConfigureAwait(false));
+			}
 		}
 		foreach (var external in externalFiles.OrderBy(file => file.TargetPath, StringComparer.OrdinalIgnoreCase))
 		{

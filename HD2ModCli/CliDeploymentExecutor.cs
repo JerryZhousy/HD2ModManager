@@ -21,10 +21,17 @@ internal static class CliDeploymentExecutor
 		CliDeploymentPlanDocument document,
 		CliWorkspace workspace,
 		CancellationToken cancellationToken = default)
+		=> await ApplyAsync(document, workspace, fastMode: false, cancellationToken).ConfigureAwait(false);
+
+	public static async ValueTask<CliDeploymentExecutionResult> ApplyAsync(
+		CliDeploymentPlanDocument document,
+		CliWorkspace workspace,
+		bool fastMode,
+		CancellationToken cancellationToken = default)
 	{
 		ArgumentNullException.ThrowIfNull(document);
 		ArgumentNullException.ThrowIfNull(workspace);
-		var firstValidation = await CliDeploymentPlanArtifacts.ValidateAsync(document, workspace, includeProcessCheck: true, cancellationToken).ConfigureAwait(false);
+		var firstValidation = await CliDeploymentPlanArtifacts.ValidateAsync(document, workspace, includeProcessCheck: true, fastMode: fastMode, previous: null, cancellationToken).ConfigureAwait(false);
 		if (!firstValidation.IsValid)
 			return new CliDeploymentExecutionResult(false, null, null, firstValidation.Diagnostics);
 
@@ -42,7 +49,7 @@ internal static class CliDeploymentExecutor
 				.ConfigureAwait(false);
 			await librarySession.VerifyReadyForMutationAsync(cancellationToken).ConfigureAwait(false);
 
-			var lockedValidation = await CliDeploymentPlanArtifacts.ValidateAsync(document, workspace, includeProcessCheck: true, cancellationToken).ConfigureAwait(false);
+			var lockedValidation = await CliDeploymentPlanArtifacts.ValidateAsync(document, workspace, includeProcessCheck: true, fastMode: fastMode, previous: firstValidation.Current, cancellationToken).ConfigureAwait(false);
 			if (!lockedValidation.IsValid || lockedValidation.Current is null)
 				return new CliDeploymentExecutionResult(false, null, null, lockedValidation.Diagnostics);
 			var current = lockedValidation.Current;
@@ -55,7 +62,7 @@ internal static class CliDeploymentExecutor
 				return new CliDeploymentExecutionResult(false, null, null, diagnostics);
 			}
 
-			var materialized = await CliDeploymentPlanArtifacts.MaterializeAsync(current, cancellationToken).ConfigureAwait(false);
+			var materialized = await CliDeploymentPlanArtifacts.MaterializeAsync(current, fastMode, cancellationToken).ConfigureAwait(false);
 			if (!materialized.IsReady)
 				return new CliDeploymentExecutionResult(false, null, null, lockedValidation.Diagnostics.Concat(materialized.Diagnostics).ToArray());
 			if (!CliDeploymentPlanArtifacts.MatchesMaterializedPlan(document, materialized))
@@ -73,7 +80,11 @@ internal static class CliDeploymentExecutor
 					new CliDeploymentDiagnostic("DeploymentUnavailable", "error", true, "capability", capability.Error ?? capability.Summary)).ToArray());
 			}
 
-			var executionPlan = materialized.ApplyPlan! with { DeploymentMethod = capability.Method.Value };
+			var executionPlan = materialized.ApplyPlan! with
+			{
+				DeploymentMethod = capability.Method.Value,
+				UseFastLinkValidation = capability.Method.Value is DeploymentMethod.HardLink or DeploymentMethod.SymbolicLink,
+			};
 			await using var transaction = await CliManagedDeploymentTransaction.BeginAsync(
 				current.OwnershipInspection,
 				executionPlan.Operations,
@@ -84,7 +95,10 @@ internal static class CliDeploymentExecutor
 			var applyResult = await CoreServices.CreateApplyExecutor()
 				.ExecuteAsync(executionPlan, CancellationToken.None, (path, token) => hashCache.GetOrComputeAsync(path, token))
 				.ConfigureAwait(false);
-			await hashCache.SaveAsync(CancellationToken.None).ConfigureAwait(false);
+			if (!fastMode)
+			{
+				await hashCache.SaveAsync(CancellationToken.None).ConfigureAwait(false);
+			}
 			var applyDiagnostics = ToDiagnostics(applyResult.Issues, "apply");
 			if (applyResult.Success)
 			{
@@ -115,6 +129,125 @@ internal static class CliDeploymentExecutor
 			[
 				new CliDeploymentDiagnostic("DeploymentApplyFailed", "error", true, "apply", exception.Message, Details: exception.ToString()),
 			]);
+		}
+	}
+
+	public static async ValueTask<CliDeploymentExecutionResult> ApplyDirectAsync(
+		CliWorkspace workspace,
+		string? profileSelector,
+		bool fastMode = true,
+		CancellationToken cancellationToken = default)
+	{
+		ArgumentNullException.ThrowIfNull(workspace);
+		var processCheck = CliDeploymentProcessGuard.Inspect();
+		if (!processCheck.IsReliable)
+		{
+			return new CliDeploymentExecutionResult(false, null, null, [
+				new CliDeploymentDiagnostic("GameProcessCheckFailed", "error", true, "process",
+					"无法可靠枚举 helldivers2.exe；为避免写入运行中的游戏，部署已被阻断。", Details: processCheck.Error)
+			]);
+		}
+		if (processCheck.IsGameRunning)
+		{
+			return new CliDeploymentExecutionResult(false, null, null, [
+				new CliDeploymentDiagnostic("GameProcessRunning", "error", true, "process",
+					$"检测到 Helldivers 2 正在运行（PID：{string.Join(", ", processCheck.ProcessIds)}）。请先退出游戏。")
+			]);
+		}
+
+		try
+		{
+			await using var librarySession = await CliWriteTargetGuard.AcquireSessionAsync(workspace, CliWriteTargetMode.Mutation, cancellationToken).ConfigureAwait(false);
+			await librarySession.VerifyReadyForMutationAsync(cancellationToken).ConfigureAwait(false);
+
+			var targetValidation = new GameDataTargetGuard().Validate(workspace.GameDataRoot, cancellationToken);
+			if (!targetValidation.IsValid || string.IsNullOrWhiteSpace(targetValidation.GameDataDirectory))
+				return new CliDeploymentExecutionResult(false, null, null, ToDiagnostics(targetValidation.Issues, "game-data"));
+
+			await using var gameLease = await CoreServices.CreateGameDataDeploymentLeaseProvider()
+				.AcquireAsync(targetValidation.GameDataDirectory, cancellationToken)
+				.ConfigureAwait(false);
+			await librarySession.VerifyReadyForMutationAsync(cancellationToken).ConfigureAwait(false);
+
+			var postLeaseProcessCheck = CliDeploymentProcessGuard.Inspect();
+			if (!postLeaseProcessCheck.IsReliable)
+			{
+				return new CliDeploymentExecutionResult(false, null, null, [
+					new CliDeploymentDiagnostic("GameProcessCheckFailed", "error", true, "process",
+						"无法可靠枚举 helldivers2.exe；为避免写入运行中的游戏，部署已被阻断。", Details: postLeaseProcessCheck.Error)
+				]);
+			}
+			if (postLeaseProcessCheck.IsGameRunning)
+			{
+				return new CliDeploymentExecutionResult(false, null, null, [
+					new CliDeploymentDiagnostic("GameProcessRunning", "error", true, "process",
+						$"检测到 Helldivers 2 正在运行（PID：{string.Join(", ", postLeaseProcessCheck.ProcessIds)}）。请先退出游戏。")
+				]);
+			}
+
+			var current = await CliDeploymentPlanArtifacts.BuildAsync(workspace, profileSelector, fastMode, cancellationToken).ConfigureAwait(false);
+			if (!current.Document.IsReady)
+				return new CliDeploymentExecutionResult(false, null, null, current.Document.Diagnostics);
+
+			if (current.OwnershipInspection is null || !current.OwnershipInspection.IsCleanBootstrap && !current.OwnershipInspection.IsManaged)
+			{
+				var diagnostics = current.Document.Diagnostics.Concat(
+				[
+					new CliDeploymentDiagnostic("DeploymentOwnershipNotProven", "error", true, "ownership", "GameData 中的现有 Patch 归属未被完整证明，已拒绝写入。"),
+				]).ToArray();
+				return new CliDeploymentExecutionResult(false, null, null, diagnostics);
+			}
+
+			var materialized = await CliDeploymentPlanArtifacts.MaterializeAsync(current, fastMode, cancellationToken).ConfigureAwait(false);
+			if (!materialized.IsReady)
+				return new CliDeploymentExecutionResult(false, null, null, current.Document.Diagnostics.Concat(materialized.Diagnostics).ToArray());
+
+			var capability = CoreServices.CreateDeploymentCapabilityService().Probe(librarySession.Paths.ModsDirectory, targetValidation.GameDataDirectory);
+			if (!capability.IsAvailable || capability.Method is null)
+			{
+				return new CliDeploymentExecutionResult(false, null, null, current.Document.Diagnostics.Concat(materialized.Diagnostics).Append(
+					new CliDeploymentDiagnostic("DeploymentUnavailable", "error", true, "capability", capability.Error ?? capability.Summary)).ToArray());
+			}
+
+			var executionPlan = materialized.ApplyPlan! with
+			{
+				DeploymentMethod = capability.Method.Value,
+				UseFastLinkValidation = capability.Method.Value is DeploymentMethod.HardLink or DeploymentMethod.SymbolicLink,
+			};
+			await using var transaction = await CliManagedDeploymentTransaction.BeginAsync(
+				current.OwnershipInspection,
+				executionPlan.Operations,
+				cancellationToken).ConfigureAwait(false);
+
+			var hashCache = CliPatchHashCache.Load(workspace.ManagerRoot);
+			var applyResult = await CoreServices.CreateApplyExecutor()
+				.ExecuteAsync(executionPlan, CancellationToken.None, (path, token) => hashCache.GetOrComputeAsync(path, token))
+				.ConfigureAwait(false);
+			if (!fastMode)
+			{
+				await hashCache.SaveAsync(CancellationToken.None).ConfigureAwait(false);
+			}
+			var applyDiagnostics = ToDiagnostics(applyResult.Issues, "apply");
+			if (applyResult.Success)
+			{
+				await transaction.CompleteAsync().ConfigureAwait(false);
+				return new CliDeploymentExecutionResult(true, capability.Method.Value.ToString().ToLowerInvariant(), applyResult, current.Document.Diagnostics.Concat(materialized.Diagnostics).Concat(applyDiagnostics).ToArray());
+			}
+
+			var rollbackDiagnostics = await transaction.RollbackAsync().ConfigureAwait(false);
+			return new CliDeploymentExecutionResult(false, capability.Method.Value.ToString().ToLowerInvariant(), applyResult, current.Document.Diagnostics.Concat(materialized.Diagnostics).Concat(applyDiagnostics).Concat(rollbackDiagnostics).ToArray());
+		}
+		catch (CliUserException exception)
+		{
+			return new CliDeploymentExecutionResult(false, null, null, [new CliDeploymentDiagnostic(exception.Code, "error", true, "apply", exception.Message)]);
+		}
+		catch (GameDataDeploymentLeaseUnavailableException exception)
+		{
+			return new CliDeploymentExecutionResult(false, null, null, [new CliDeploymentDiagnostic("GameDataDeploymentBusy", "error", true, "apply", "GameData 正被另一条部署操作占用；请等待后重试。", exception.GameDataDirectory, Details: exception.ToString())]);
+		}
+		catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or DirectoryNotFoundException or FileNotFoundException)
+		{
+			return new CliDeploymentExecutionResult(false, null, null, [new CliDeploymentDiagnostic("DeploymentApplyFailed", "error", true, "apply", exception.Message, Details: exception.ToString())]);
 		}
 	}
 

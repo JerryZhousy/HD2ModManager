@@ -1355,7 +1355,7 @@ public static class CliApplication
 			var output = RequireOutput(invocation.Options, "deploy plan");
 			var workspace = CliWorkspace.Open(invocation.Options);
 			var selector = invocation.Command.Count == 3 ? invocation.Command[2] : null;
-			var build = await CliDeploymentPlanArtifacts.BuildAsync(workspace, selector).ConfigureAwait(false);
+			var build = await CliDeploymentPlanArtifacts.BuildAsync(workspace, selector, fastMode: invocation.Options.Fast).ConfigureAwait(false);
 			await CliOutput.WriteExplicitFileAsync(output, CliOutput.ToJson(build.Document), invocation.Options.Overwrite).ConfigureAwait(false);
 			Emit(invocation.Options,
 				new { ok = build.Document.IsReady, output = Path.GetFullPath(output), deployment = CreateDeploymentPlanProjection(build.Document) },
@@ -1366,19 +1366,31 @@ public static class CliApplication
 		{
 			EnsureDeploymentValidateOptions(invocation.Options);
 			var document = await CliDeploymentPlanArtifacts.ReadDocumentAsync(RequireDeploymentPlan(invocation.Options)).ConfigureAwait(false);
-			var validation = await CliDeploymentPlanArtifacts.ValidateAsync(document, CliWorkspace.Open(invocation.Options), includeProcessCheck: true).ConfigureAwait(false);
+			var validation = await CliDeploymentPlanArtifacts.ValidateAsync(document, CliWorkspace.Open(invocation.Options), includeProcessCheck: true, fastMode: invocation.Options.Fast).ConfigureAwait(false);
 			Emit(invocation.Options,
 				new { ok = validation.IsValid, validation = CreateDeploymentValidationProjection(validation) },
 				() => FormatDeploymentValidation(validation));
 			return validation.IsValid ? 0 : 2;
 		}
-		if (Matches(command, "deploy", "apply"))
+		if (command.Length is 2 or 3 && command[0] == "deploy" && command[1] == "apply")
 		{
 			EnsureDeploymentApplyOptions(invocation.Options);
 			if (!invocation.Options.Confirm)
 				throw new CliUserException("DeploymentApplyConfirmationRequired", "deploy apply 会写入 GameData；请在人工确认后显式传入 --confirm。 ");
-			var document = await CliDeploymentPlanArtifacts.ReadDocumentAsync(RequireDeploymentPlan(invocation.Options)).ConfigureAwait(false);
-			var execution = await CliDeploymentExecutor.ApplyAsync(document, CliWorkspace.Open(invocation.Options)).ConfigureAwait(false);
+
+			var workspace = CliWorkspace.Open(invocation.Options);
+			CliDeploymentExecutionResult execution;
+			if (string.IsNullOrWhiteSpace(invocation.Options.Plan))
+			{
+				var selector = invocation.Command.Count == 3 ? invocation.Command[2] : null;
+				execution = await CliDeploymentExecutor.ApplyDirectAsync(workspace, selector, fastMode: invocation.Options.Fast).ConfigureAwait(false);
+			}
+			else
+			{
+				var document = await CliDeploymentPlanArtifacts.ReadDocumentAsync(invocation.Options.Plan).ConfigureAwait(false);
+				execution = await CliDeploymentExecutor.ApplyAsync(document, workspace, fastMode: invocation.Options.Fast).ConfigureAwait(false);
+			}
+
 			Emit(invocation.Options,
 				new { ok = execution.Success, execution = CreateDeploymentExecutionProjection(execution) },
 				() => FormatDeploymentExecution(execution));
@@ -4903,7 +4915,7 @@ public static class CliApplication
 		if (!string.IsNullOrWhiteSpace(options.Plan) || options.Confirm || !string.IsNullOrWhiteSpace(options.Host)
 			|| options.Position is not null || options.SetActive || options.WithUnsharedOptions)
 		{
-			throw new CliUserException("CommandOptionNotSupported", "deploy plan 仅接受配置标识、--manager-root、--library、--game-data、--output、--overwrite 与 --json。");
+			throw new CliUserException("CommandOptionNotSupported", "deploy plan 仅接受配置标识、--fast、--manager-root、--library、--game-data、--output、--overwrite 与 --json。");
 		}
 	}
 
@@ -4912,7 +4924,7 @@ public static class CliApplication
 		if (!string.IsNullOrWhiteSpace(options.Output) || options.Overwrite || options.Confirm || !string.IsNullOrWhiteSpace(options.Host)
 			|| options.Position is not null || options.SetActive || options.WithUnsharedOptions)
 		{
-			throw new CliUserException("CommandOptionNotSupported", "deploy validate 仅接受 --plan、--manager-root、--library、--game-data 与 --json。");
+			throw new CliUserException("CommandOptionNotSupported", "deploy validate 仅接受 --plan、--fast、--manager-root、--library、--game-data 与 --json。");
 		}
 	}
 
@@ -4921,7 +4933,7 @@ public static class CliApplication
 		if (!string.IsNullOrWhiteSpace(options.Output) || options.Overwrite || !string.IsNullOrWhiteSpace(options.Host)
 			|| options.Position is not null || options.SetActive || options.WithUnsharedOptions)
 		{
-			throw new CliUserException("CommandOptionNotSupported", "deploy apply 仅接受 --plan、--manager-root、--library、--game-data、--confirm 与 --json。");
+			throw new CliUserException("CommandOptionNotSupported", "deploy apply 仅接受配置标识、--plan、--fast、--manager-root、--library、--game-data、--confirm 与 --json。");
 		}
 	}
 
@@ -8763,6 +8775,7 @@ HD2 Mod Manager 命令行
 	  hd2mod deploy plan [配置名称、GUID或active] --manager-root <管理器目录> --game-data <游戏data目录> --output deployment-plan.json --json
 	  hd2mod deploy validate --plan deployment-plan.json --manager-root <管理器目录> --game-data <游戏data目录> --json
 	  hd2mod deploy apply --plan deployment-plan.json --manager-root <管理器目录> --game-data <游戏data目录> --confirm --json
+	  hd2mod deploy apply [配置名称、GUID或active] --manager-root <管理器目录> --game-data <游戏data目录> --confirm --fast --json  （直通免计划极速部署）
 	  hd2mod deploy deactivate plan --manager-root <管理器目录> --game-data <游戏data目录> --output deactivation-plan.json --json
 	  hd2mod deploy deactivate validate --plan deactivation-plan.json --manager-root <管理器目录> --game-data <游戏data目录> --json
 	  hd2mod deploy deactivate apply --plan deactivation-plan.json --manager-root <管理器目录> --game-data <游戏data目录> --confirm --json
@@ -8929,6 +8942,7 @@ Unit 数据视图（只读；直接解析 Patch 内的 Unit 网格与骨骼，�
 	  --set-active              创建配置时同时将它设为活动配置。
 	  --with-unshared-options   删除主体时同时删除没有幸存主体的递归 Option（仅 delete 命令可用）。
 	  --confirm               所有写入命令的明确确认。
+	  --fast                  极速模式（跳过 Patch 物理全量 SHA-256，采用硬链接与轻量时间戳快速指纹，支持 deploy plan / apply）。
 
 	安全边界：Mod 库写入要求桌面端关闭、严格库读取、跨进程库租约和显式 --confirm。mod delete plan 会冻结库状态、激活状态与待删目录内容，validate/apply 会重新确认。library sync 只更新 library.json 的节点记录，不会导入、删除、移动或部署 Mod，也不会写 Profile、激活状态或派生缓存。import --add-to-profile 仅加入明确计划中的配置，不自动部署。deploy apply 额外要求游戏退出、真实 GameData、双租约与完整 Patch 归属证明；不会接管未知 Patch，也不会执行 Mod Lua。批量 Patch 修复只会替换计划中仍确认过时且被 selected 的 Mod：每个 Patch 家族会先备份，候选失败会恢复原文件，成功后才更新对应库指纹并回建当前活动的管理器 Overwrite。主体派生 Overwrite 永不覆盖非管理器生成的 Overwrite。Patch 资源重打包、头盔合并、装饰外部包和单 Patch Same-key 修复都只写入新的库外目录；不会替换、自动导入、启用或部署结果。
 """;

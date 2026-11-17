@@ -162,7 +162,9 @@ public sealed record CliGlobalOptions(
 	// 不同来源模型自己的头身比也不一样。它只影响几何，不碰材质与任何 id，
 	// 所以改它不会让材质包失配 —— 但**会改变产物字节**，重构建必须带上同一个值
 	// 才是同一份产物（管理器把它当全局几何参数，每次重构建按当前设置传入）。
-	double? HeadScale = null);
+	double? HeadScale = null,
+	// 快速部署/规划模式（免全量 SHA-256 哈希计算与硬链接直通）。
+	bool Fast = false);
 
 public sealed record CliInvocation(IReadOnlyList<string> Command, CliGlobalOptions Options);
 
@@ -233,6 +235,7 @@ public static class CliArgumentParser
 		var confirm = false;
 		var json = false;
 		var dryRun = false;
+		var fast = false;
 		var command = new List<string>();
 
 		for (var index = 0; index < args.Length; index++)
@@ -613,6 +616,9 @@ public static class CliArgumentParser
 				case "--dry-run":
 					dryRun = true;
 					break;
+				case "--fast":
+					fast = true;
+					break;
 				case "--json":
 					json = true;
 					break;
@@ -632,7 +638,7 @@ public static class CliArgumentParser
 		}
 
 		if (command.Count == 0) command.Add("help");
-		return new CliInvocation(command, new CliGlobalOptions(managerRoot, library, gameData, registryRoot, output, plan, host, addToProfile, keys, addKeys, removeKeys, archiveId, kind, header, picks, position, limit, cursor, setActive, withUnsharedOptions, withEffective, onlyCompetition, overwrite, confirm, json, avatarToc, boneHash, components, name, materialSource, albedoFactor, matcap, donor, file, sections, dryRun, idNamespace, disabled, cutout, idNamespaceToken, matcapGain, metalRoughness, metalCutout, cutoutTemplate, unitIds, reuseModel, headMerge, headMergeConsent, vpkList, materialSourceList, componentSourceList, treatAs, treatAsList, alphaExperiment, ditherScale, ditherDensity, ditherPattern, normalFlipY, noDraw, cutoutGeometry, headScale));
+		return new CliInvocation(command, new CliGlobalOptions(managerRoot, library, gameData, registryRoot, output, plan, host, addToProfile, keys, addKeys, removeKeys, archiveId, kind, header, picks, position, limit, cursor, setActive, withUnsharedOptions, withEffective, onlyCompetition, overwrite, confirm, json, avatarToc, boneHash, components, name, materialSource, albedoFactor, matcap, donor, file, sections, dryRun, idNamespace, disabled, cutout, idNamespaceToken, matcapGain, metalRoughness, metalCutout, cutoutTemplate, unitIds, reuseModel, headMerge, headMergeConsent, vpkList, materialSourceList, componentSourceList, treatAs, treatAsList, alphaExperiment, ditherScale, ditherDensity, ditherPattern, normalFlipY, noDraw, cutoutGeometry, headScale, fast));
 	}
 
 	private static string ReadValue(string[] args, ref int index, string option)
