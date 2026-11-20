@@ -11,6 +11,7 @@ using System.Windows.Media;
 using HD2ModCore.Application;
 using HD2ModCore.Domain;
 using HD2ModCore.Infrastructure;
+using HD2ModCore.Infrastructure.Diagnostics;
 using HD2ModManager.Services;
 using HD2ModManager.Controls.Actions;
 using HD2ModManager.Controls.EmptyState;
@@ -210,8 +211,21 @@ namespace HD2ModManager.ViewModels
             if (System.Windows.Application.Current?.MainWindow?.DataContext is ShellViewModel shell) shell.OpenMessagePanel();
         }
 
-        private static void LaunchGame()
-            => System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("steam://run/553850") { UseShellExecute = true });
+        private void LaunchGame()
+        {
+            var profile = _profiles.ActiveProfile;
+            using var diagnostic = DiagnosticOperations.Begin(DiagnosticAction.LaunchGame, profile: profile?.Id.Value, revision: profile?.Revision);
+            try
+            {
+                using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("steam://run/553850") { UseShellExecute = true });
+                diagnostic.Finish(DiagnosticResult.Completed, "SteamLaunchRequested");
+            }
+            catch (Exception exception)
+            {
+                diagnostic.Finish(DiagnosticResult.Failed, exception: exception);
+                throw;
+            }
+        }
 
         private async Task RepairOutdatedModsAsync()
         {
@@ -332,13 +346,120 @@ namespace HD2ModManager.ViewModels
                     return;
                 }
 
+                var storageKindResolver = CoreServices.CreateModStorageKindResolver();
+                var legacyNodes = nodes
+                    .Where(node => !RebuildTargetScope.IsSectionalSeries(Path.Combine(_library.ModsRootDirectory, node.RelativePath), storageKindResolver))
+                    .ToArray();
+                var sectionalNodes = nodes
+                    .Where(node => RebuildTargetScope.IsSectionalSeries(Path.Combine(_library.ModsRootDirectory, node.RelativePath), storageKindResolver))
+                    .ToArray();
+
                 ModRepairBatchResult? result = null;
-                if (nodes.Count > 0)
+                if (legacyNodes.Length > 0)
                 {
                     task.UpdateStage("正在生成并验证重构候选");
                     task.UpdateProgress(null);
-                    result = await _repairBatch.RepairAsync(nodes, _library.ModsRootDirectory, gameData, task.CancellationToken, new InlineProgress<OperationProgressEvent>(bridge.Apply), operationId);
+                    result = await _repairBatch.RepairAsync(legacyNodes, _library.ModsRootDirectory, gameData, task.CancellationToken, new InlineProgress<OperationProgressEvent>(bridge.Apply), operationId);
                     task.UpdateStage($"已修复 {result.RepairedModCount}；跳过 {result.SkippedModCount}；失败 {result.FailedModCount}；取消 {result.CanceledModCount}；未开始 {result.NotStartedModCount}");
+                }
+
+                var sectionalRepairedMods = 0;
+                var sectionalFailedMods = 0;
+                var sectionalCanceledMods = 0;
+                var sectionalNotStartedMods = 0;
+                var modelFailureNotes = new List<string>();
+                if (result is not null)
+                {
+                    foreach (var item in result.Mods.Where(mod => mod.Status is ModRepairBatchModStatus.CandidateFailed or ModRepairBatchModStatus.CommitFailed))
+                        modelFailureNotes.Add($"{item.Name}：{item.Detail ?? "重构失败"}");
+                }
+
+                if (sectionalNodes.Length > 0)
+                {
+                    var baseVpkContext = SettingsService.CreateVpkHostContext() with { GameDataFolder = gameData };
+                    for (var index = 0; index < sectionalNodes.Length; index++)
+                    {
+                        var sectionalNode = sectionalNodes[index];
+                        var vpkContext = baseVpkContext with { ModDisplayName = sectionalNode.Metadata.Name };
+                        if (task.CancellationToken.IsCancellationRequested)
+                        {
+                            sectionalNotStartedMods += sectionalNodes.Length - index;
+                            break;
+                        }
+
+                        var sectionalDir = Path.Combine(_library.ModsRootDirectory, sectionalNode.RelativePath);
+                        var kind = storageKindResolver.Resolve(sectionalDir);
+                        task.UpdateStage($"正在重构建分段式 Mod {index + 1}/{sectionalNodes.Length}：{sectionalNode.Metadata.Name}");
+                        task.UpdateProgress((double)(index + 1) / sectionalNodes.Length);
+                        try
+                        {
+                            bool ok;
+                            string? error;
+                            IReadOnlyList<string> notes;
+                            if (kind == ModStorageKind.Sectional)
+                            {
+                                var outcome = await Legacy2SectionalConverter.RunAsync(
+                                    sectionalNode.Id.Value.ToString("N"),
+                                    sectionalDir,
+                                    vpkContext,
+                                    stage => task.UpdateStage($"{sectionalNode.Metadata.Name}：{stage}"),
+                                    task.CancellationToken);
+                                ok = outcome.Ok;
+                                error = outcome.Error;
+                                notes = outcome.Notes;
+                            }
+                            else
+                            {
+                                var outcome = await VpkRebuildService.RunAsync(
+                                    sectionalNode.Id.Value.ToString("N"),
+                                    sectionalDir,
+                                    vpkContext,
+                                    targetArchiveIds: null,
+                                    disabledSections: null,
+                                    stage => task.UpdateStage($"{sectionalNode.Metadata.Name}：{stage}"),
+                                    task.CancellationToken);
+                                ok = outcome.Ok;
+                                error = outcome.Error;
+                                notes = outcome.Notes;
+                            }
+
+                            await _library.InvalidateContentNodeAsync(sectionalNode.Id, CancellationToken.None);
+                            if (!ok)
+                            {
+                                sectionalFailedMods++;
+                                modelFailureNotes.Add($"{sectionalNode.Metadata.Name}：{error ?? "分段式重构建失败"}");
+                                continue;
+                            }
+
+                            var rechecked = await _library.InformationCenter.RequestUnitVersionAsync(
+                                sectionalNode,
+                                _library.ModsRootDirectory,
+                                new ModInformationRequest(ModInformationKind.UnitVersion, "PostSectionalRepairCheck", RequireFresh: true),
+                                CancellationToken.None);
+                            if (rechecked.Data?.Report.IsOutdated == false)
+                            {
+                                sectionalRepairedMods++;
+                            }
+                            else
+                            {
+                                sectionalFailedMods++;
+                                var detail = notes.Count > 0
+                                    ? string.Join("；", notes.Take(2))
+                                    : "重构建后仍包含旧版 Unit。";
+                                modelFailureNotes.Add($"{sectionalNode.Metadata.Name}：{detail}");
+                            }
+                        }
+                        catch (OperationCanceledException) when (task.CancellationToken.IsCancellationRequested)
+                        {
+                            sectionalCanceledMods++;
+                        }
+                        catch (Exception sectionalException)
+                        {
+                            sectionalFailedMods++;
+                            modelFailureNotes.Add($"{sectionalNode.Metadata.Name}：{sectionalException.Message}");
+                            LogService.Warn($"分段式 Mod 修复失败 {sectionalNode.Metadata.Name}：{sectionalException.Message}");
+                        }
+                    }
                 }
 
                 var audioRepairedMods = 0;
@@ -371,28 +492,40 @@ namespace HD2ModManager.ViewModels
                     }
                 }
 
-                if (result is not null && (result.CanceledModCount > 0 || result.NotStartedModCount > 0) || task.CancellationToken.IsCancellationRequested) task.MarkCanceled();
+                var totalRepairedModels = (result?.RepairedModCount ?? 0) + sectionalRepairedMods;
+                var totalSkippedModels = result?.SkippedModCount ?? 0;
+                var totalFailedModels = (result?.FailedModCount ?? 0) + sectionalFailedMods;
+                var totalCanceledModels = (result?.CanceledModCount ?? 0) + sectionalCanceledMods;
+                var totalNotStartedModels = (result?.NotStartedModCount ?? 0) + sectionalNotStartedMods;
+                var hasModelRepairs = (result?.HasRepairs == true) || sectionalRepairedMods > 0;
+
+                if (totalCanceledModels > 0 || totalNotStartedModels > 0 || task.CancellationToken.IsCancellationRequested) task.MarkCanceled();
                 else task.MarkCompleted();
-                if (audioRepairedMods > 0 && result?.HasRepairs != true)
+                if (audioRepairedMods > 0 && !hasModelRepairs)
                 {
                     // 音效补丁同样是原地替换了 Mod 目录中的文件，指纹必须同步，否则下次启动会被当成外部修改。
-                    await _library.SynchronizeAsync(task.CancellationToken);
+                    await _library.SynchronizeAsync(CancellationToken.None);
                     if (_profiles.ActiveProfile is not null) _profiles.NotifyActiveModContentChanged();
                 }
-                if (result is not null && result.HasRepairs)
+                if (hasModelRepairs)
                 {
                     // 修复过程直接替换了 Mod 目录中的 Patch；必须同步并持久化新的 ContentFingerprint，
                     // 否则下次启动会把本次已知修改误判为外部修改并删除所有信息中心缓存。
-                    await _library.SynchronizeAsync(task.CancellationToken);
+                    await _library.SynchronizeAsync(CancellationToken.None);
                     task.UpdateStage("正在使用修复后的来源重建已启用装饰");
-                    var rebuiltHosts = await _library.RebuildAllActiveDecorationOverwritesAsync(task.CancellationToken);
+                    var rebuiltHosts = await _library.RebuildAllActiveDecorationOverwritesAsync(CancellationToken.None);
                     LogService.Info($"一键修复后已重建装饰 Overwrite：主体数={rebuiltHosts}。");
                     if (_profiles.ActiveProfile is not null) _profiles.NotifyActiveModContentChanged();
-                    ClearOutdatedDetectionResult();
+                    if (totalFailedModels == 0 && totalCanceledModels == 0 && totalNotStartedModels == 0)
+                        ClearOutdatedDetectionResult();
+                    else
+                        SetOutdatedDetectionResult(totalFailedModels + totalCanceledModels + totalNotStartedModels, unreadableCount);
                 }
                 var report = new System.Text.StringBuilder("批次完成。");
-                if (result is not null)
-                    report.Append($"\n已修复：{result.RepairedModCount}\n跳过：{result.SkippedModCount}\n失败：{result.FailedModCount}\n取消：{result.CanceledModCount}\n未开始：{result.NotStartedModCount}");
+                if (nodes.Count > 0)
+                    report.Append($"\n已修复：{totalRepairedModels}\n跳过：{totalSkippedModels}\n失败：{totalFailedModels}\n取消：{totalCanceledModels}\n未开始：{totalNotStartedModels}");
+                if (modelFailureNotes.Count > 0)
+                    report.Append("\n\n模型修复失败详情：\n" + string.Join("\n", modelFailureNotes.Take(5)) + (modelFailureNotes.Count > 5 ? $"\n…另有 {modelFailureNotes.Count - 5} 条" : string.Empty));
                 if (repairableAudioNodes.Length > 0)
                     report.Append($"\n音效已重建：{audioRepairedMods} 个 Mod" + (audioFailedMods > 0 ? $"；失败：{audioFailedMods}" : string.Empty));
                 if (audioFailureNotes.Count > 0)
@@ -400,8 +533,13 @@ namespace HD2ModManager.ViewModels
                 if (audioFallbackNotes.Count > 0)
                     report.Append("\n\n以下音库已退回官方版本（Mod 音色失效）：\n" + string.Join("\n", audioFallbackNotes.Take(5)) + (audioFallbackNotes.Count > 5 ? $"\n…另有 {audioFallbackNotes.Count - 5} 条" : string.Empty));
                 if (audioRepairedMods > 0) report.Append($"\n\n音效备份：{audioBackupRoot}\n需要重新部署后，游戏里才会生效。");
-                if (result is not null) report.Append($"\n\n备份与审计清单：{result.BatchDirectory}");
-                var failed = (result?.FailedModCount ?? 0) + audioFailedMods;
+                if (result is not null)
+                {
+                    if (result.Mods.Any(item => item.BackupCompleted))
+                        report.Append($"\n\n备份目录：{result.BatchDirectory}");
+                    report.Append($"\n审计清单：{result.ManifestPath}");
+                }
+                var failed = totalFailedModels + audioFailedMods;
                 HD2ModManager.Views.AppDialog.Show(report.ToString(), "一键修复", System.Windows.MessageBoxButton.OK, failed == 0 ? System.Windows.MessageBoxImage.Information : System.Windows.MessageBoxImage.Warning);
             }
             catch (OperationCanceledException)
@@ -547,13 +685,42 @@ namespace HD2ModManager.ViewModels
         public string CurrentProfileTitle => _profiles.SelectedKey ?? "未选择配置";
         public string ItemCountText => $"显示 {_list.VisibleCount} / {_profiles.SelectedProfile?.Entries.Count ?? 0} 个 Mod";
         public string HeaderSummary => $"{ItemCountText} · {ActiveProfileText} · {SelectedProfileState}";
-        // 配置页的空状态：不提供命令（切页由壳层管），只给一句能照做的说明。
-        public EmptyStatePresentation? EmptyState => _list.VisibleCount > 0
-            ? null
-            : new EmptyStatePresentation(
-                "这个配置里还没有 Mod",
-                "把左侧模组库里的 Mod 拖进来；或在库页选中它们，点底栏的「加入配置」。",
-                Icon: EmptyStateIcon.Inbox);
+        // 搜索态那一排按钮里的宿主筛选（配置页只有「过时」）。
+        public IReadOnlyList<ModListSearchFilter> SearchFilters { get; }
+        // 有没有任何筛选在生效：决定空状态说"配置是空的"还是"筛没了"。
+        private bool HasFilters => !string.IsNullOrWhiteSpace(_query) || _showOnlyOutdated || Category.IsActive;
+        // 配置页的空状态：没有筛选时不提供命令（切页由壳层管），有筛选时给一个真能清干净的。
+        public EmptyStatePresentation? EmptyState
+        {
+            get
+            {
+                if (_list.VisibleCount > 0) return null;
+                if (HasFilters)
+                {
+                    return new EmptyStatePresentation(
+                        "没有匹配的 Mod",
+                        "试试去掉几枚标签或更短的关键词，或者清除全部筛选回到这个配置的全部内容。",
+                        "清除全部筛选",
+                        ClearFiltersCommand,
+                        EmptyStateIcon.Search);
+                }
+
+                return new EmptyStatePresentation(
+                    "这个配置里还没有 Mod",
+                    "把左侧模组库里的 Mod 拖进来；或在库页选中它们，点底栏的「加入配置」。",
+                    Icon: EmptyStateIcon.Inbox);
+            }
+        }
+
+        private RelayCommand? _clearFiltersCommand;
+        public RelayCommand ClearFiltersCommand => _clearFiltersCommand ??= new RelayCommand(ClearFilters);
+
+        private void ClearFilters()
+        {
+            Query = string.Empty;
+            ShowOnlyOutdated = false;
+            Category.ClearSelection();
+        }
         private bool _showOnlyOutdated;
         public bool ShowOnlyOutdated
         {
@@ -561,12 +728,10 @@ namespace HD2ModManager.ViewModels
             set
             {
                 if (!SetField(ref _showOnlyOutdated, value)) return;
-                OnPropertyChanged(nameof(OutdatedFilterText));
                 OnPropertyChanged(nameof(CanReorder));
                 Refresh(ListTransitionKind.Filter);
             }
         }
-        public string OutdatedFilterText => ShowOnlyOutdated ? "显示全部" : "显示过时";
         public bool CanReorder => string.IsNullOrWhiteSpace(Query) && !ShowOnlyOutdated && !Category.IsActive;
         private bool _canAcceptLibraryDrop;
         public bool CanAcceptLibraryDrop => _canAcceptLibraryDrop;
@@ -616,6 +781,11 @@ namespace HD2ModManager.ViewModels
             _derivedState = derivedState;
             _selection = selection;
             _bottomBar = bottomBar;
+            SearchFilters = new[]
+            {
+                new ModListSearchFilter("outdated", "过时", () => ShowOnlyOutdated, value => ShowOnlyOutdated = value,
+                    "只看与当前游戏版本不兼容的 Mod；再点一次取消"),
+            };
             _list = new ModListStateController<ProfileModListState, ProfileListItemViewModel>(
                 state => state.Guid,
                 state => state.PresentationVersion,
@@ -1586,7 +1756,7 @@ namespace HD2ModManager.ViewModels
     /// <summary>设置页「物理模式」下拉框的一项。</summary>
     public sealed record PhysicsModeOption(PhysicsMode Value, string DisplayName, string Description);
 
-    public class SettingsPageViewModel : PageViewModel
+    public partial class SettingsPageViewModel : PageViewModel
     {
 		private readonly ProfileService _profiles;
 		private readonly ModLibraryService _library;
@@ -1635,7 +1805,9 @@ namespace HD2ModManager.ViewModels
             get => SettingsService.GetBuiltInLuaEnabled();
             set
             {
-                SettingsService.SetBuiltInLuaEnabled(value);
+                var changed = value != SettingsService.GetBuiltInLuaEnabled();
+                if (SettingsService.SetBuiltInLuaEnabled(value) && changed)
+                    _profiles.RequestActiveProfileDeployment();
                 OnPropertyChanged(nameof(BuiltInLuaEnabled));
                 // 选项集合变了，下拉要重建；当前值也可能被收敛过，一并刷新。
                 OnPropertyChanged(nameof(ArmorMappingModeOptions));
@@ -1670,18 +1842,8 @@ namespace HD2ModManager.ViewModels
             get => SettingsService.GetArmorMappingMode();
             set
             {
-                var changed = value != SettingsService.GetArmorMappingMode();
                 if (SettingsService.SetArmorMappingMode(value))
-                {
                     _profiles.RequestActiveProfileDeployment();
-                    // 同 PhysicsMode：每次切到外置都对齐一次导出包（理由见那里）。
-                    if (value == ArmorMappingMode.ExternalLuaEntry)
-                    {
-                        var refreshed = EnsureLuaPackageUpToDate(LuaAddonCatalog.Wardrobe());
-                        if (changed) OpenLuaPackagesFolder();
-                        if (refreshed) NoteLuaPackageRefreshed([LuaAddonCatalog.Wardrobe()]);
-                    }
-                }
                 OnPropertyChanged(nameof(ArmorMappingMode));
                 OnPropertyChanged(nameof(ArmorMappingModeDescription));
                 OnPropertyChanged(nameof(ArmorMappingModeHotSwitchNote));
@@ -1729,132 +1891,6 @@ namespace HD2ModManager.ViewModels
         /// <summary>物理模式的一句话说明。</summary>
         public string PhysicsModeDescription => PhysicsMode.Description();
 
-        /// <summary>
-        /// 把某个内置 Lua 功能导出成外置包并打开**根目录**。
-        ///
-        /// 两个功能落在同一个根目录下（各自一个子目录），所以不管用户先选哪个，
-        /// 打开的都是同一个地方——他装了几个加载器、需要哪份包，一眼就能看到。
-        /// </summary>
-        private static void RevealLuaPackage(LuaAddonPackageExport.Feature feature)
-        {
-            try
-            {
-                var root = SettingsService.GetLuaPackagesDirectory();
-                LuaAddonPackageExport.Export(root, feature);
-                OpenFolder(root);
-            }
-            catch (Exception exception) when (exception is IOException
-                or UnauthorizedAccessException
-                or InvalidOperationException)
-            {
-                // 导出失败不应让设置保存失败。
-            }
-        }
-
-        /// <summary>
-        /// 让导出目录里那份包与**当前版本**一致；内容本来就一样就什么都不做。
-        /// <para>
-        /// 只比内容、不比时间戳：`LuaAddonPackageExport.Export` 每次都整目录重建，
-        /// 无脑重导会让时间戳一直变、也会把用户在用的那份删一次再建一次。
-        /// </para>
-        /// </summary>
-        /// <returns>真的写过盘（＝用户手里那份是旧的或缺失）时返回 true。</returns>
-        private static bool EnsureLuaPackageUpToDate(LuaAddonPackageExport.Feature feature)
-        {
-            try
-            {
-                var root = SettingsService.GetLuaPackagesDirectory();
-                var luaPath = Path.Combine(root, feature.Key, "lua版", feature.LuaFileName);
-                if (File.Exists(luaPath)
-                    && string.Equals(File.ReadAllText(luaPath), feature.Source, StringComparison.Ordinal))
-                {
-                    return false;
-                }
-
-                LuaAddonPackageExport.Export(root, feature);
-                return true;
-            }
-            catch (Exception exception) when (exception is IOException
-                or UnauthorizedAccessException
-                or InvalidOperationException)
-            {
-                return false;
-            }
-        }
-
-        /// <summary>打开外置包根目录（两个功能共用同一个根）。</summary>
-        private static void OpenLuaPackagesFolder()
-        {
-            try
-            {
-                var root = SettingsService.GetLuaPackagesDirectory();
-                Directory.CreateDirectory(root);
-                OpenFolder(root);
-            }
-            catch (Exception exception) when (exception is IOException
-                or UnauthorizedAccessException
-                or InvalidOperationException)
-            {
-                // 打不开目录不影响导出本身。
-            }
-        }
-
-        /// <summary>记一次"外置包刚刷新过"，并提示用户把它重新装进 mod 库。</summary>
-        private void NoteLuaPackageRefreshed(IReadOnlyList<LuaAddonPackageExport.Feature> features)
-        {
-            if (features.Count == 0) return;
-            LuaPackageUpdateHint =
-                "外置包已更新到当前版本（" + string.Join("、", features.Select(feature => feature.Title))
-                + "）：请把它们重新拖进 mod 库替换旧的那一份，否则游戏里跑的还是旧脚本。";
-        }
-
-        private string _luaPackageUpdateHint = string.Empty;
-
-        /// <summary>
-        /// 外置包刷新提示（空 = 不显示）。
-        /// 只在"确实写过盘"时出现：升级管理器后第一次打开设置页，或切到外置那一下。
-        /// </summary>
-        public string LuaPackageUpdateHint
-        {
-            get => _luaPackageUpdateHint;
-            private set
-            {
-                if (!SetField(ref _luaPackageUpdateHint, value)) return;
-                OnPropertyChanged(nameof(HasLuaPackageUpdateHint));
-            }
-        }
-
-        public bool HasLuaPackageUpdateHint => !string.IsNullOrEmpty(_luaPackageUpdateHint);
-
-        /// <summary>
-        /// 启动时把"已经是外置模式"的那些包对齐到当前版本。
-        /// <para>
-        /// 这是升级路径上唯一的自救点：用户选了外置之后通常一辈子不会再动那个下拉，
-        /// 只靠"切换时导出"等于升级后永远不更新——物理运行时的修复就这样到不了他手上。
-        /// 这里比对内容，只有真的变了才写盘。
-        /// </para>
-        /// </summary>
-        private void RefreshLuaPackagesOnStartup()
-        {
-            // 物理外置已改成部署自动投放（§15.2），这里只剩映射的导出包。
-            var refreshed = new List<LuaAddonPackageExport.Feature>();
-            if (SettingsService.GetArmorMappingMode() == ArmorMappingMode.ExternalLuaEntry)
-            {
-                var feature = LuaAddonCatalog.Wardrobe();
-                if (EnsureLuaPackageUpToDate(feature)) refreshed.Add(feature);
-            }
-
-            NoteLuaPackageRefreshed(refreshed);
-        }
-
-        /// <summary>
-        /// 关闭独占模式时把运行时脚本导出到「默认导出路径\wardrobe-lua」并打开该文件夹，
-        /// 让用户可以直接把它丢给第三方加载器。导出失败不影响设置本身已保存。
-        /// </summary>
-        private static void RevealRuntimeScriptForExternalLoader()
-        {
-            RevealLuaPackage(LuaAddonCatalog.Wardrobe());
-        }
     public bool AutoUpdateAssetMetadata
         {
             get => SettingsService.GetAutoUpdateAssetMetadata();
@@ -2060,6 +2096,8 @@ namespace HD2ModManager.ViewModels
 
         public override void Dispose()
         {
+            _disposedForDiagnostics = true;
+            _diagnosticExport?.Cancel();
             AppUpdate.Dispose();
             base.Dispose();
         }
@@ -2072,6 +2110,9 @@ namespace HD2ModManager.ViewModels
 			_library = library;
             _bottomBar = bottomBar ?? throw new ArgumentNullException(nameof(bottomBar));
             _backgroundTasks = backgroundTasks;
+            ExportDiagnosticsCommand = new AsyncRelayCommand(_ => ExportDiagnosticsAsync(), _ => _diagnosticExport is null);
+            CancelDiagnosticExportCommand = new RelayCommand(() => _diagnosticExport?.Cancel());
+            OpenDiagnosticFolderCommand = new RelayCommand(_ => OpenDiagnosticFolder(), _ => _diagnosticFolder is not null);
 			_modLibraryFolderCandidate = SettingsService.GetModLibraryFolder();
 			_modLibrarySwitchBar = new ModLibrarySwitchBottomBarViewModel(RestartAndSwitchModLibrary, CancelModLibrarySwitch);
             OpenModFolderCommand = new RelayCommand(() => OpenFolder(ModLibraryFolder));
@@ -2096,9 +2137,6 @@ namespace HD2ModManager.ViewModels
             BuildAssetIndexCommand = new RelayCommand(_ => _ = BuildAssetIndexAsync(), _ => !IsBuildingAssetIndex);
             // 不设 canExecute：按钮永远可点，缺什么由 VerifyWithSteamAsync 当场说清（见那里的注释）。
             VerifyWithSteamCommand = new RelayCommand(_ => _ = VerifyWithSteamAsync());
-
-            // 早就是外置模式的用户永远不会再点那个下拉，唯一的刷新机会就是这里。
-            RefreshLuaPackagesOnStartup();
         }
 
         bool isVerifyingWithSteam;
@@ -2367,6 +2405,8 @@ namespace HD2ModManager.ViewModels
                 var archiveHashes = await CoreServices.CreateFileSystemArchiveHashesProvider(_paths)
                     .GetArchiveHashesJsonAsync(cancellationToken);
                 var status = await index.GetIndexStatusAsync(gameData, archiveHashes, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                _lastDiagnosticIndexStatus = status;
                 SettingsService.SetLastGameDataIndexCheckUtc(DateTime.UtcNow);
                 OnPropertyChanged(nameof(GameDataIndexLastCheckText));
                 AssetIndexState = ToDisplayState(status.State);
@@ -2586,7 +2626,7 @@ namespace HD2ModManager.ViewModels
         {
             if (string.IsNullOrWhiteSpace(folder)) return;
             if (!System.IO.Directory.Exists(folder)) System.IO.Directory.CreateDirectory(folder);
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = folder, UseShellExecute = true });
+            using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = folder, UseShellExecute = true });
         }
 
         private void OpenGameDataFolder()

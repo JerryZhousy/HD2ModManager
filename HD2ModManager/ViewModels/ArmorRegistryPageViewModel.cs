@@ -9,6 +9,7 @@ using System.Windows;
 using HD2ModCore.Application;
 using HD2ModCore.Domain;
 using HD2ModCore.Infrastructure;
+using HD2ModCore.Infrastructure.KitInstance;
 using HD2ModCore.Infrastructure.Sectional;
 using HD2ModManager.Models;
 using HD2ModManager.Services;
@@ -19,12 +20,14 @@ namespace HD2ModManager.ViewModels;
 
 public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 {
-	private enum AvailableArmorUnitFilter
-	{
-		All,
-		HasEffectiveUnitOverride,
-		NoEffectiveUnitOverride,
-	}
+	// 右侧表的三类行（标签条按这个顺序排，与旧版从左到右一致）。
+	// 「已映射」不在其中：它不是一类行，而是"要不要显示被占用的行"的可见性开关。
+	private static readonly ArmorMappingPickerTab[] PickerTabOrder =
+	[
+		ArmorMappingPickerTab.Set,
+		ArmorMappingPickerTab.Armor,
+		ArmorMappingPickerTab.Helmet,
+	];
 
 	private readonly RuntimeArmorRegistryService service;
 	private readonly NotificationService notifications;
@@ -46,20 +49,32 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 	private string providersSearchText = string.Empty;
 	private string availableSearchText = string.Empty;
 	private string providerDetailSearchText = string.Empty;
-	private AvailableArmorUnitFilter availableArmorUnitFilter;
-	private ArmorMappingPickerTab selectedAvailableTab = ArmorMappingPickerTab.Set;
+	// Unit 覆盖筛选：两枚**互不排斥**的标签（命中 / 未命中）。都没选或都选中 = 不筛：
+	// 并集就是全集，界面必须如实反映"没有筛选"，而不是留一个说不清的状态。
+	private bool unitOverrideHitFilter;
+	private bool unitOverrideMissFilter;
+	// 右侧表只有一张（游戏数据里的一行一条）。下面这三个是**筛选**标签：互不排斥，都不选 = 三类全要。
+	private readonly HashSet<ArmorMappingPickerTab> selectedPickerTabs = new();
+	// 可见性开关（「已映射」）：被占用的行（作为视觉来源、或已映射到某个来源）默认不列，勾上才显示。
+	private bool showOccupiedRows;
 	private uint? selectedProviderId;
 	private IReadOnlyList<uint> selectedProviderMemberIds = [];
-	private readonly HashSet<uint> pendingProviderIds = [];
+	// 层 2 的"来源表"（游戏条目里被显式指定为视觉来源的那些）。和自定义素体一样：
+	// **来源独立存在，不依赖它上面有没有目标**——所以它必须落盘（document.SourceItemIds），
+	// 也正因为如此，删掉某个来源的最后一个目标不会再让它从左侧消失。
+	private readonly HashSet<uint> sourceItemIds = [];
 	private IReadOnlyList<RuntimeArmorCatalogEntry> cachedCatalog = [];
 	private ArmorTwinIndex cachedTwinIndex = ArmorTwinIndex.Empty;
 	private string? notifiedAutoCompletedTwinFingerprint;
 	private IReadOnlyDictionary<uint, RuntimeArmorCatalogEntry> cachedCatalogById = new Dictionary<uint, RuntimeArmorCatalogEntry>();
 	private ArmorMappingPickerBaseCatalog cachedPickerBaseCatalog = new([], [], []);
-	private IReadOnlyDictionary<uint, string> cachedManagedOwnerByItemId = new Dictionary<uint, string>();
+	// 右侧表现在自己表达"占用"（IsSource / MappedTo），规划器不再负责把被占用的行删掉或置灰；
+	// 它只保留真正该管的不可用判断（2 槽压缩 / SEAF / NPC）。
+	private static readonly IReadOnlyDictionary<uint, string> NoManagedOwners = new Dictionary<uint, string>();
 	private readonly Dictionary<ArmorMappingPickerTab, IReadOnlyList<RuntimeArmorChoiceViewModel>> availableChoicesByTab = new();
 	private readonly Dictionary<string, RuntimeArmorChoiceViewModel> allAvailableChoicesByKey = new(StringComparer.OrdinalIgnoreCase);
 	private bool isSelectedProviderTwoSlotCompressed;
+	private bool isSelectedProviderThreeSlotCompressed;
 	private IReadOnlyDictionary<string, ArmorDisplayFacts> cachedArmorDisplayFacts = new Dictionary<string, ArmorDisplayFacts>(StringComparer.OrdinalIgnoreCase);
 	private IReadOnlyList<RuntimeArmorRegistryModel> modelDefinitions = [];
 	// 素体 key → 所属 Mod 在库里现在的名字。素体在界面上叫什么，以它为准（见 ApplySnapshot）。
@@ -143,7 +158,35 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		RemoveCustomModelCommand = new RelayCommand(
 			parameter => RemoveCustomModel(parameter as RuntimeArmorModelEditorViewModel),
 			_ => !IsBusy);
-		SelectAvailableTabCommand = new RelayCommand(SelectAvailableTab);
+		// 六枚标签：四个选项卡 + 两个 Unit 覆盖方向。顺序与旧版从左到右一致；互不排斥。
+		// 「已映射」与「含选项」同一个模型：默认不列，选中才放出来。
+		SearchFilters = new[]
+		{
+			new ModListSearchFilter("set", "套装",
+				() => IsPickerTabSelected(ArmorMappingPickerTab.Set),
+				value => SetPickerTabSelected(ArmorMappingPickerTab.Set, value),
+				() => $"套装 · {CountFilteredTabItems(ArmorMappingPickerTab.Set)} 项"),
+			new ModListSearchFilter("armor", "护甲",
+				() => IsPickerTabSelected(ArmorMappingPickerTab.Armor),
+				value => SetPickerTabSelected(ArmorMappingPickerTab.Armor, value),
+				() => $"护甲 · {CountFilteredTabItems(ArmorMappingPickerTab.Armor)} 项"),
+			new ModListSearchFilter("helmet", "头盔",
+				() => IsPickerTabSelected(ArmorMappingPickerTab.Helmet),
+				value => SetPickerTabSelected(ArmorMappingPickerTab.Helmet, value),
+				() => $"头盔 · {CountFilteredTabItems(ArmorMappingPickerTab.Helmet)} 项"),
+			new ModListSearchFilter("occupied", "已映射",
+				() => showOccupiedRows,
+				SetShowOccupiedRows,
+				() => $"把已经被占用的护甲（作为视觉来源、或已映射到某个来源）也列出来（默认不列）· {CountOccupiedRows()} 项"),
+			new ModListSearchFilter("unit-hit", "Unit 命中",
+				() => IsUnitOverrideSelected(hit: true),
+				value => SetUnitOverrideSelected(hit: true, value),
+				"只看当前活动配置里真的生效了 Unit 覆盖的护甲"),
+			new ModListSearchFilter("unit-miss", "Unit 未命中",
+				() => IsUnitOverrideSelected(hit: false),
+				value => SetUnitOverrideSelected(hit: false, value),
+				"只看当前活动配置里没有生效 Unit 覆盖的护甲"),
+		};
 		// **没有"新增自定义素体"这个动作。**
 		//
 		// 素体不是一个能凭空造的对象：它是一套**已存在**的 Unit（来自某个 Mod 的 patch）。
@@ -186,52 +229,44 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		{
 			if (!SetField(ref availableSearchText, value ?? string.Empty)) return;
 			AvailableArmorsView.Refresh();
-			RaiseTabHeaderPropertiesChanged();
+			RefreshSearchFilterState();
 			OnPropertyChanged(nameof(AvailableSummary));
 		}
 	}
 
-	public ArmorMappingPickerTab SelectedAvailableTab => selectedAvailableTab;
-	public bool IsSetTabSelected => selectedAvailableTab == ArmorMappingPickerTab.Set;
-	public bool IsArmorTabSelected => selectedAvailableTab == ArmorMappingPickerTab.Armor;
-	public bool IsHelmetTabSelected => selectedAvailableTab == ArmorMappingPickerTab.Helmet;
-	public string SetTabHeader => $"套装 ({CountFilteredTabItems(ArmorMappingPickerTab.Set)})";
-	public string ArmorTabHeader => $"护甲 ({CountFilteredTabItems(ArmorMappingPickerTab.Armor)})";
-	public string HelmetTabHeader => $"头盔 ({CountFilteredTabItems(ArmorMappingPickerTab.Helmet)})";
+	// 搜索态标签条上的六枚标签：三个筛选（套装 / 护甲 / 头盔）+ 一个可见性开关（已映射）+ 两个 Unit 覆盖方向。
+	// 全都不互斥；「已映射」只决定"要不要显示被占用的行"，不参与筛选。
+	public IReadOnlyList<ModListSearchFilter> SearchFilters { get; }
 
-	public string AvailableArmorUnitFilterText => availableArmorUnitFilter switch
+	private bool IsPickerTabSelected(ArmorMappingPickerTab tab) => selectedPickerTabs.Contains(tab);
+
+	private void SetPickerTabSelected(ArmorMappingPickerTab tab, bool selected)
 	{
-		AvailableArmorUnitFilter.HasEffectiveUnitOverride => "Unit 覆盖：已命中",
-		AvailableArmorUnitFilter.NoEffectiveUnitOverride => "Unit 覆盖：未命中",
-		_ => "Unit 覆盖：全部",
-	};
+		var changed = selected ? selectedPickerTabs.Add(tab) : selectedPickerTabs.Remove(tab);
+		if (!changed) return;
+		RefreshAvailableRows();
+	}
 
-	public void SelectAvailableTab(object? parameter)
+	// 只选了一边才筛：两边都选（并集 = 全集）或都不选都是"没有筛选"。
+	private bool IsUnitOverrideFilterActive => unitOverrideHitFilter ^ unitOverrideMissFilter;
+
+	private bool IsUnitOverrideSelected(bool hit) => hit ? unitOverrideHitFilter : unitOverrideMissFilter;
+
+	private void SetUnitOverrideSelected(bool hit, bool value)
 	{
-		var next = parameter switch
-		{
-			ArmorMappingPickerTab tab => tab,
-			string text when Enum.TryParse<ArmorMappingPickerTab>(text, ignoreCase: true, out var parsed) => parsed,
-			_ => selectedAvailableTab,
-		};
-		if (next == selectedAvailableTab) return;
-
-		selectedAvailableTab = next;
-		OnPropertyChanged(nameof(SelectedAvailableTab));
-		OnPropertyChanged(nameof(IsSetTabSelected));
-		OnPropertyChanged(nameof(IsArmorTabSelected));
-		OnPropertyChanged(nameof(IsHelmetTabSelected));
-
-		var rows = availableChoicesByTab.GetValueOrDefault(selectedAvailableTab) ?? [];
-		var activeSelected = ArmorRegistryScopes.IsAvailable(selection.Scope)
-			? selection.SelectedIds.ToHashSet(StringComparer.OrdinalIgnoreCase)
-			: null;
-		foreach (var row in rows)
-			row.IsSelected = activeSelected is not null && !row.IsBlocked && activeSelected.Contains(row.SelectionKey);
-
-		AvailableArmors.ReplaceWith(rows, ListTransitionKind.Replace);
+		if (IsUnitOverrideSelected(hit) == value) return;
+		if (hit) unitOverrideHitFilter = value;
+		else unitOverrideMissFilter = value;
 		AvailableArmorsView.Refresh();
+		RefreshSearchFilterState();
 		OnPropertyChanged(nameof(AvailableSummary));
+		OnPropertyChanged(nameof(AvailableEmptyMessage));
+	}
+
+	// 标签的选中态与提示（带数量）都跟着筛选结果变，改完状态刷一遍。
+	private void RefreshSearchFilterState()
+	{
+		foreach (var filter in SearchFilters) filter.RefreshSelection();
 	}
 
 	private int CountFilteredTabItems(ArmorMappingPickerTab tab)
@@ -241,31 +276,64 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		var count = 0;
 		foreach (var item in items)
 		{
-			if (FilterAvailableArmor(item))
+			// 数量要和"此刻看得见的列表"一致：被占用的行在「已映射」关着时不出现，就不该算进去。
+			if ((showOccupiedRows || !item.IsHidden) && FilterAvailableArmor(item))
 				count++;
 		}
 		return count;
 	}
 
-	private void RaiseTabHeaderPropertiesChanged()
+	// 「已映射」是可见性开关，不是筛选：它只决定要不要把被占用的行放出来。
+	private void SetShowOccupiedRows(bool value)
 	{
-		OnPropertyChanged(nameof(SetTabHeader));
-		OnPropertyChanged(nameof(ArmorTabHeader));
-		OnPropertyChanged(nameof(HelmetTabHeader));
+		if (showOccupiedRows == value) return;
+		showOccupiedRows = value;
+		RefreshAvailableRows();
 	}
 
-	public void CycleAvailableArmorUnitFilter()
+	// 被占用的行有多少（跟着搜索 / Unit 筛选走），给标签一个实时数量。
+	private int CountOccupiedRows()
 	{
-		availableArmorUnitFilter = availableArmorUnitFilter switch
+		var count = 0;
+		foreach (var tab in PickerTabOrder)
 		{
-			AvailableArmorUnitFilter.All => AvailableArmorUnitFilter.HasEffectiveUnitOverride,
-			AvailableArmorUnitFilter.HasEffectiveUnitOverride => AvailableArmorUnitFilter.NoEffectiveUnitOverride,
-			_ => AvailableArmorUnitFilter.All,
-		};
-		OnPropertyChanged(nameof(AvailableArmorUnitFilterText));
+			foreach (var row in availableChoicesByTab.GetValueOrDefault(tab) ?? [])
+			{
+				if (row.IsHidden && FilterAvailableArmor(row)) count++;
+			}
+		}
+		return count;
+	}
+
+	// 选中的标签变了：按顺序把它们的行并起来（去重），空选择 = 四类全显示。
+	private void RefreshAvailableRows()
+	{
+		AvailableArmors.ReplaceWith(BuildVisibleAvailableRows(), ListTransitionKind.Replace);
 		AvailableArmorsView.Refresh();
-		RaiseTabHeaderPropertiesChanged();
+		RefreshSearchFilterState();
 		OnPropertyChanged(nameof(AvailableSummary));
+		OnPropertyChanged(nameof(AvailableEmptyMessage));
+	}
+
+	private IReadOnlyList<RuntimeArmorChoiceViewModel> BuildVisibleAvailableRows()
+	{
+		// 右侧表 = 游戏数据里的一行一条（套装 / 护甲 / 头盔）。这三个标签只是**筛选**：
+		// 都不选 = 三类全要；选了就是它们的并集。
+		var narrowed = selectedPickerTabs.Count != 0;
+		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		var rows = new List<RuntimeArmorChoiceViewModel>();
+		foreach (var tab in PickerTabOrder)
+		{
+			if (narrowed && !selectedPickerTabs.Contains(tab)) continue;
+			foreach (var row in availableChoicesByTab.GetValueOrDefault(tab) ?? [])
+			{
+				if (seen.Add(row.SelectionKey)) rows.Add(row);
+			}
+		}
+
+		// 可见性：被占用的行（视觉来源 / 已映射的目标）默认不列，「已映射」标签把它们放出来。
+		if (!showOccupiedRows) rows.RemoveAll(row => row.IsHidden);
+		return rows;
 	}
 
 	public string ProviderDetailSearchText
@@ -411,10 +479,17 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 	public string ProvidersSummary => providersSearchText.Length == 0
 		? $"{Providers.Count} 个视觉来源"
 		: $"{ProvidersView.Cast<object>().Count()} / {Providers.Count} 个视觉来源";
-	public string AvailableSummary => availableSearchText.Length == 0
-		&& availableArmorUnitFilter == AvailableArmorUnitFilter.All
-			? $"{AvailableArmors.Count} 项可选"
-		: $"{AvailableArmorsView.Cast<object>().Count()} / {AvailableArmors.Count} 项可选";
+	// 筛选过就报"可见 / 总数"，没筛选就只报总数——数字自己会说明有没有在筛。
+	public string AvailableSummary
+	{
+		get
+		{
+			var visible = AvailableArmorsView.Cast<object>().Count();
+			var total = AvailableArmors.Count;
+			var filtered = availableSearchText.Length != 0 || IsUnitOverrideFilterActive || selectedPickerTabs.Count != 0 || showOccupiedRows;
+			return filtered ? $"{visible} / {total} 项" : $"{total} 项";
+		}
+	}
 	public string ProviderDetailTitle => selectedProviderId is { } id
 		? Providers.FirstOrDefault(item => item.MemberItemIds.SequenceEqual(selectedProviderMemberIds))?.Name
 			?? (selectedProviderMemberIds.Count > 1
@@ -454,7 +529,6 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 	public AsyncRelayCommand ApplyCommand { get; }
 	public RelayCommand OpenRegistryFolderCommand { get; }
 	public RelayCommand RemoveCustomModelCommand { get; }
-	public RelayCommand SelectAvailableTabCommand { get; }
 
 	// 页面首次打开：目录、快照与覆盖事实都还没有，走一次完整加载。
 	// 加载是单飞的（见 EnsureCatalogLoadedAsync），所以它与启动预热**共用同一次**。
@@ -649,7 +723,10 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		var twinIndex = authority is not null
 			? ArmorTwinBundling.BuildTwinIndex(authority.Kits)
 			: ArmorTwinIndex.Empty;
-		return (await snapshotTask.ConfigureAwait(false), await catalogTask.ConfigureAwait(false), twinIndex);
+		// 飞船 NPC（女舰长、维修技术员）的伪记录：没有护甲记录，追加进目录才会出现在选品器里（见 KitNpcRecords）。
+		var catalog = await catalogTask.ConfigureAwait(false);
+		if (catalog.Count != 0) catalog = KitNpcRecords.AppendTo(catalog);
+		return (await snapshotTask.ConfigureAwait(false), catalog, twinIndex);
 	}
 
 	public async Task RefreshRuntimeStatusAsync()
@@ -771,9 +848,14 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 				ResolveChoice(mapping.TargetItemId),
 				ResolveChoice(sourceItemId)));
 		}
+		// 来源表来自层 2（document.SourceItemIds）。整表重读时完全以磁盘为准；
+		// 后台刷新只做**并集**——否则"刚提升为来源、还没落盘"的那一下就被一次刷新吞掉了
+		// （旧实现每次刷新都 pendingProviderIds.Clear()，正是那个 bug）。
+		if (resetNavigation) sourceItemIds.Clear();
+		foreach (var sourceItemId in snapshot.Document.SourceItemIds) sourceItemIds.Add(sourceItemId);
+
 		if (resetNavigation)
 		{
-			pendingProviderIds.Clear();
 			selectedProviderId = null;
 			selectedProviderMemberIds = [];
 			OnPropertyChanged(nameof(IsProviderDetailOpen));
@@ -786,7 +868,6 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			// Never close the target card just because the source has no targets yet: an empty
 			// card with a back button is honest, a card that closes itself is a trap.
 			var keepProvider = selectedProviderId is { } openProviderId && ProviderStillExists(openProviderId);
-			pendingProviderIds.Clear();
 			if (!keepProvider)
 			{
 				selectedProviderId = null;
@@ -987,23 +1068,16 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 	public void ApplyAvailableSelection(IReadOnlyList<string> selectedKeys)
 	{
 		var scope = IsProviderDetailOpen ? ArmorRegistryScopes.AvailableAsTarget : ArmorRegistryScopes.Available;
-		var currentTabKeys = AvailableArmors
+		// 标签不互斥之后，"当前看得见的行"就是唯一判据：看不见的行不该保持选中，
+		// 否则底栏的注册/解除会作用到用户根本看不到的东西上。
+		// 被占用的行现在也在同一张表里（IsHidden 只影响默认可见性，不影响能不能选）。
+		var visibleKeys = AvailableArmors
 			.Select(item => item.SelectionKey)
 			.ToHashSet(StringComparer.OrdinalIgnoreCase);
-		var validActiveKeys = selectedKeys
-			.Where(key => currentTabKeys.Contains(key)
+		var combinedKeys = selectedKeys
+			.Where(key => visibleKeys.Contains(key)
 				&& allAvailableChoicesByKey.TryGetValue(key, out var item)
 				&& !item.IsBlocked)
-			.ToArray();
-		var otherTabSelectedKeys = ArmorRegistryScopes.IsAvailable(selection.Scope)
-			? selection.SelectedIds
-				.Where(key => allAvailableChoicesByKey.TryGetValue(key, out var item)
-					&& !item.IsBlocked
-					&& item.PickerTab != selectedAvailableTab)
-				.ToArray()
-			: [];
-		var combinedKeys = validActiveKeys
-			.Concat(otherTabSelectedKeys)
 			.Distinct(StringComparer.OrdinalIgnoreCase)
 			.ToArray();
 		ApplyMutuallyExclusiveSelection(scope, AvailableArmors, combinedKeys);
@@ -1051,6 +1125,17 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		RebuildProjections();
 	}
 
+	public void NavigateToMappedProvider(RuntimeArmorChoiceViewModel? mappedItem)
+	{
+		if (mappedItem is null || string.IsNullOrWhiteSpace(mappedItem.MappedProviderKey)) return;
+		if (!string.IsNullOrEmpty(ProvidersSearchText))
+			ProvidersSearchText = string.Empty;
+		var provider = Providers.FirstOrDefault(item =>
+			string.Equals(item.SelectionKey, mappedItem.MappedProviderKey, StringComparison.OrdinalIgnoreCase));
+		if (provider is null) return;
+		OpenProviderDetails(provider);
+	}
+
 	public void CloseProvider()
 	{
 		if (selectedProviderId is null) return;
@@ -1070,10 +1155,10 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 
 
 
-	// 这个来源还在不在？三种存在形式：待建（pending）、已有映射、或本身就是注册素体。
-	// 判据里刻意不看"有没有映射"——没有映射的待建来源同样必须留在列表里。
+	// 这个来源还在不在？三种存在形式：来源表里、已有映射、或本身就是注册素体。
+	// 判据里刻意不看"有没有映射"——没有映射的来源同样必须留在列表里（这就是来源表存在的意义）。
 	private bool ProviderStillExists(uint providerItemId)
-		=> pendingProviderIds.Contains(providerItemId)
+		=> sourceItemIds.Contains(providerItemId)
 			|| Mappings.Any(mapping => mapping.Source.ItemId == providerItemId)
 			|| CustomModels.Any(model => SyntheticModelItemId(model.Key) == providerItemId);
 
@@ -1085,9 +1170,8 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		if (selection.Scope is not { } scope || !scope.StartsWith("ArmorRegistry:", StringComparison.Ordinal)) return;
 		var selected = selection.SelectedIds;
 		if (selected.Count == 0) return;
-		var visible = allAvailableChoicesByKey.Values
+		var visible = AvailableArmors
 			.Where(item => !item.IsBlocked)
-			.Concat(AvailableArmors.Where(item => !item.IsBlocked))
 			.Concat(Providers)
 			.Concat(ProviderDetailItems)
 			.Select(item => item.SelectionKey)
@@ -1140,7 +1224,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		var ids = items.SelectMany(item => item.ProviderSourceItemIds).Distinct().ToArray();
 		if (ids.Length == 0 || ids.Any(id => !Choices.ContainsKey(id))) return;
 		foreach (var id in ids)
-			pendingProviderIds.Add(id);
+			sourceItemIds.Add(id);
 		RebuildProjections();
 		RecomputeHasChanges();
 		selection.Clear();
@@ -1218,8 +1302,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		var items = new List<RuntimeArmorChoiceViewModel>(keys.Count);
 		foreach (var key in keys)
 		{
-			if (!allAvailableChoicesByKey.TryGetValue(key, out var item) || item.IsBlocked)
-				return null;
+			if (!allAvailableChoicesByKey.TryGetValue(key, out var item) || item.IsBlocked) return null;
 			items.Add(item);
 		}
 		return items.ToArray();
@@ -1232,45 +1315,85 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 	{
 		var items = ResolveAssignableItems(keys);
 		if (items is null) return;
-		if (selectedProviderId is null)
-		{
-			var providerSourceIds = items
-				.SelectMany(item => item.ProviderSourceItemIds)
-				.Distinct()
-				.ToArray();
-			if (providerSourceIds.Length == 0 || providerSourceIds.Any(id => !Choices.ContainsKey(id))) return;
-			if (items.Length > 1)
-			{
-				foreach (var id in providerSourceIds)
-					pendingProviderIds.Add(id);
-				RebuildProjections();
-				RecomputeHasChanges();
-				selection.Clear();
-				return;
-			}
+		if (selectedProviderId is null) AssignAsProviders(items);
+		else AssignAsTargets(items);
+	}
 
+	// 没有打开来源：把选中的护甲"转为视觉来源"。
+	// 已经是来源的（素体一定在来源里）不再重复登记，但也**不能装没看见**——告诉用户下一步该做什么。
+	private void AssignAsProviders(RuntimeArmorChoiceViewModel[] items)
+	{
+		var alreadySources = items.Where(IsSourceRow).ToArray();
+		if (alreadySources.Length > 0)
+		{
+			notifications.Show(
+				$"{alreadySources[0].Name} 已经是视觉来源。要把它改成另一个来源的映射目标，"
+				+ "请先在左侧打开那个来源（点它），再把它拖进目标列表，或用底栏的「注册为映射目标」。",
+				NotificationLevel.Info,
+				TimeSpan.FromSeconds(10),
+				"护甲映射");
+		}
+
+		items = items.Where(item => !IsSourceRow(item)).ToArray();
+		if (items.Length == 0) return;
+
+		var providerSourceIds = items
+			.SelectMany(item => item.ProviderSourceItemIds)
+			.Distinct()
+			.ToArray();
+		if (providerSourceIds.Length == 0 || providerSourceIds.Any(id => !Choices.ContainsKey(id))) return;
+		if (items.Length > 1)
+		{
 			foreach (var id in providerSourceIds)
-				pendingProviderIds.Add(id);
-			selectedProviderId = providerSourceIds[0];
-			selectedProviderMemberIds = providerSourceIds;
-			OnPropertyChanged(nameof(IsProviderDetailOpen));
-			OnPropertyChanged(nameof(ProviderDetailTitle));
-			OnPropertyChanged(nameof(ProviderDetailHeaderTitle));
-			OnPropertyChanged(nameof(AvailableRowActionToolTip));
-			OnPropertyChanged(nameof(ProviderDetailSummary));
+				sourceItemIds.Add(id);
 			RebuildProjections();
+			RecomputeHasChanges();
 			selection.Clear();
 			return;
 		}
+
+		foreach (var id in providerSourceIds)
+			sourceItemIds.Add(id);
+		selectedProviderId = providerSourceIds[0];
+		selectedProviderMemberIds = providerSourceIds;
+		OnPropertyChanged(nameof(IsProviderDetailOpen));
+		OnPropertyChanged(nameof(ProviderDetailTitle));
+		OnPropertyChanged(nameof(ProviderDetailHeaderTitle));
+		OnPropertyChanged(nameof(AvailableRowActionToolTip));
+		OnPropertyChanged(nameof(ProviderDetailSummary));
+		RebuildProjections();
+		selection.Clear();
+	}
+
+	// 打开了某个来源：把选中的护甲注册成**它的目标**。
+	// 其中"本来就是视觉来源"的那些要先把来源身份解散——那会释放它名下的映射，所以有目标时必须先问一句。
+	private void AssignAsTargets(RuntimeArmorChoiceViewModel[] items)
+	{
+		var sourceIds = selectedProviderMemberIds.Count > 0
+			? selectedProviderMemberIds
+			: [selectedProviderId!.Value];
+
+		// 目的来源自己不能被降级：它正被你当"目标容器"用（把来源拖进它自己的目标列表 = 无意义操作）。
+		items = items.Where(item => !item.MemberItemIds.Any(sourceIds.Contains)).ToArray();
+		if (items.Length == 0) return;
+
+		var dissolving = items.Where(IsSourceRow).ToArray();
+		var risky = dissolving.Where(item => TargetCountOf(item) > 0).ToArray();
+		if (risky.Length > 0 && !ConfirmDissolve(risky))
+		{
+			// 取消：只跳过这几个有目标的，其余"干净"的照做。
+			items = items.Where(item => !risky.Contains(item)).ToArray();
+			if (items.Length == 0) return;
+			dissolving = items.Where(IsSourceRow).ToArray();
+		}
+
+		foreach (var item in dissolving) DissolveSource(item);
 
 		var ids = items
 			.SelectMany(item => item.MemberItemIds)
 			.Distinct()
 			.ToArray();
 
-		var sourceIds = selectedProviderMemberIds.Count > 0
-			? selectedProviderMemberIds
-			: [selectedProviderId.Value];
 		var sourceMembers = sourceIds
 			.Where(Choices.ContainsKey)
 			.Select(sourceId =>
@@ -1285,15 +1408,24 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		var unpaired = 0;
 		foreach (var id in ids)
 		{
-			if (!Choices.TryGetValue(id, out var targetChoice)
-				|| Mappings.Any(mapping => mapping.Target.ItemId == id)
-				|| Providers.Any(provider => provider.MemberItemIds.Contains(id))) continue;
+			if (!Choices.TryGetValue(id, out var targetChoice) || sourceIds.Contains(id)) continue;
 			var sourceId = RuntimeArmorMappingPairing.FindUniqueSourceForTarget(sourceMembers, targetChoice.KitKind);
 			if (sourceId is null || sourceId == id || !Choices.TryGetValue(sourceId.Value, out var sourceChoice))
 			{
 				unpaired++;
 				continue;
 			}
+
+			// 已经挂在这个来源下：幂等跳过，不重复建行。
+			// 挂在**别的**来源下：这是"重定向"——把那条映射挪过来，而不是再添一条。
+			// （同一个护甲同时挂在两个来源下时运行时只会认其中一条，用户看到的是"改了没生效"。）
+			var existing = Mappings.FirstOrDefault(mapping => mapping.Target.ItemId == id);
+			if (existing is not null)
+			{
+				if (existing.Source.ItemId == sourceId) continue;
+				Mappings.Remove(existing);
+			}
+
 			Mappings.Add(new RuntimeArmorMappingRowViewModel(
 				targetChoice,
 				sourceChoice,
@@ -1311,12 +1443,42 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 				TimeSpan.FromSeconds(8),
 				"护甲映射");
 		}
-		foreach (var sourceId in sourceIds)
-			if (ids.Any(id => Mappings.Any(mapping => mapping.Source.ItemId == sourceId && mapping.Target.ItemId == id)))
-				pendingProviderIds.Remove(sourceId);
 		RebuildProjections();
 		RecomputeHasChanges();
 		selection.Clear();
+	}
+
+	// 这一行是不是"视觉来源"：在来源表里、或是某条映射的来源。
+	// （素体永远在来源侧，但它不出现在右侧表里，所以这里不用管。）
+	private bool IsSourceRow(RuntimeArmorChoiceViewModel item)
+		=> item.MemberItemIds.Any(id => sourceItemIds.Contains(id))
+			|| item.MemberItemIds.Any(id => Mappings.Any(mapping => mapping.Source.ItemId == id));
+
+	// 这个来源名下有几个映射目标（解散它会释放这些）。
+	private int TargetCountOf(RuntimeArmorChoiceViewModel item)
+		=> Mappings.Count(mapping => item.MemberItemIds.Contains(mapping.Source.ItemId));
+
+	// 解散来源身份：从来源表摘掉 + 删掉它名下的映射（那些目标回到未映射）。
+	private void DissolveSource(RuntimeArmorChoiceViewModel item)
+	{
+		foreach (var memberId in item.MemberItemIds) sourceItemIds.Remove(memberId);
+		foreach (var mapping in Mappings.Where(candidate => item.MemberItemIds.Contains(candidate.Source.ItemId)).ToArray())
+			Mappings.Remove(mapping);
+		if (selectedProviderId is { } openProviderId && item.MemberItemIds.Contains(openProviderId)) CloseProvider();
+	}
+
+	// 一次可能降级好几个来源：逐条列出来，让用户看清"哪些会被解散、各自带着几个目标"。
+	private bool ConfirmDissolve(IReadOnlyList<RuntimeArmorChoiceViewModel> sources)
+	{
+		var lines = sources.Select(item => $"「{item.Name}」已经作为视觉来源并映射了 {TargetCountOf(item)} 个对象");
+		var message = string.Join(Environment.NewLine, lines)
+			+ Environment.NewLine + Environment.NewLine
+			+ "重定向将会使这些条目被释放（它们名下的映射会被解除，不会跟到新来源去）。";
+		return Views.AppDialog.Show(
+			message,
+			"把视觉来源改成映射目标",
+			System.Windows.MessageBoxButton.YesNo,
+			System.Windows.MessageBoxImage.Warning) == System.Windows.MessageBoxResult.Yes;
 	}
 
 	public bool CanReleaseToAvailable(IReadOnlyList<string> keys)
@@ -1430,7 +1592,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		{
 			var removed = Mappings.Where(mapping => selectedSources.Contains(mapping.Source.ItemId)).ToArray();
 			foreach (var mapping in removed) Mappings.Remove(mapping);
-			foreach (var sourceId in selectedSources) pendingProviderIds.Remove(sourceId);
+			foreach (var sourceId in selectedSources) sourceItemIds.Remove(sourceId);
 			if (selectedProviderMemberIds.Any(selectedSources.Contains)) CloseProvider();
 		}
 		else
@@ -1439,7 +1601,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			foreach (var mapping in removed) Mappings.Remove(mapping);
 			if (selectedProviderId is not null
 				&& selectedProviderMemberIds.All(currentSource =>
-					!pendingProviderIds.Contains(currentSource)
+					!sourceItemIds.Contains(currentSource)
 					&& !Mappings.Any(mapping => mapping.Source.ItemId == currentSource)))
 				CloseProvider();
 		}
@@ -1451,7 +1613,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 	private void RebuildProjections()
 	{
 		var sourceIds = Mappings.Select(mapping => mapping.Source.ItemId)
-			.Concat(pendingProviderIds)
+			.Concat(sourceItemIds)
 			.Concat(CustomModels.Select(model => SyntheticModelItemId(model.Key)))
 			.ToHashSet();
 
@@ -1485,21 +1647,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 				.Select(mapping => mapping.Target.ItemId)
 				.Distinct()
 				.ToArray();
-			var targetEntries = detailTargetIds
-				.Select(id =>
-				{
-					if (cachedCatalogById.TryGetValue(id, out var catalogEntry))
-						return catalogEntry;
-					var fallback = ResolveChoice(id);
-					return new RuntimeArmorCatalogEntry(
-						id,
-						fallback.ArchiveId,
-						fallback.Name,
-						fallback.KitKind,
-						fallback.SetId,
-						fallback.DlcId);
-				})
-				.ToArray();
+			var targetEntries = ResolveTargetCatalogEntries(detailTargetIds);
 			var selectedTargetKeys = string.Equals(selection.Scope, ArmorRegistryScopes.Targets, StringComparison.Ordinal)
 				? selection.SelectedIds.ToHashSet(StringComparer.OrdinalIgnoreCase)
 				: null;
@@ -1515,21 +1663,6 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		}
 		ProviderDetailItems.ReplaceWith(detailItems, ListTransitionKind.Replace);
 
-		var managedOwners = new Dictionary<uint, string>();
-		foreach (var provider in Providers)
-		{
-			foreach (var memberId in provider.MemberItemIds)
-				managedOwners[memberId] = "作为视觉来源使用中";
-		}
-		foreach (var mapping in Mappings)
-		{
-			var providerName = Providers
-				.FirstOrDefault(provider => provider.MemberItemIds.Contains(mapping.Source.ItemId))
-				?.Name ?? mapping.Source.Name;
-			managedOwners[mapping.Target.ItemId] = $"已映射到 {providerName}";
-		}
-		cachedManagedOwnerByItemId = managedOwners;
-
 		UpdateAvailablePickerProjection(forceReplaceActiveTab: true);
 
 		OnPropertyChanged(nameof(ProvidersSummary));
@@ -1541,6 +1674,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 
 	private void UpdateSelectedProviderTwoSlotState()
 	{
+		isSelectedProviderThreeSlotCompressed = false;
 		if (selectedProviderId is not { } openProviderId)
 		{
 			isSelectedProviderTwoSlotCompressed = false;
@@ -1568,6 +1702,10 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			modsDirectory,
 			openProvider.ModelKey,
 			lowPollutionMode: true);
+		isSelectedProviderThreeSlotCompressed = ArmorMappingPickerPlanner.IsThreeSlotCompressedCustomModel(
+			modsDirectory,
+			openProvider.ModelKey,
+			lowPollutionMode: true);
 	}
 
 	private void UpdateAvailablePickerProjection(bool forceReplaceActiveTab)
@@ -1578,27 +1716,70 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 
 		var projection = ArmorMappingPickerPlanner.EvaluateProjection(
 			cachedPickerBaseCatalog,
-			cachedManagedOwnerByItemId,
+			NoManagedOwners,
 			activeSelectedKeys,
-			isSelectedProviderTwoSlotCompressed);
+			isSelectedProviderTwoSlotCompressed,
+			isSelectedProviderThreeSlotCompressed,
+			SettingsService.GetEffectiveLowPollutionMode(),
+			selectedProviderId is { } providerId && Choices.GetValueOrDefault(providerId) is { IsCustomModel: true });
 
 		SyncPickerTab(ArmorMappingPickerTab.Set, projection.Sets, activeSelectedKeys, forceReplaceActiveTab);
 		SyncPickerTab(ArmorMappingPickerTab.Armor, projection.Armors, activeSelectedKeys, forceReplaceActiveTab);
 		SyncPickerTab(ArmorMappingPickerTab.Helmet, projection.Helmets, activeSelectedKeys, forceReplaceActiveTab);
 
 		allAvailableChoicesByKey.Clear();
-		foreach (var list in availableChoicesByTab.Values)
+		foreach (var (_, list) in availableChoicesByTab)
 		{
 			foreach (var item in list)
 				allAvailableChoicesByKey[item.SelectionKey] = item;
 		}
 
-		var activeRows = availableChoicesByTab.GetValueOrDefault(selectedAvailableTab) ?? [];
+		// 每行自带占用状态：是视觉来源、还是被映射到了某个来源。可见性只读这个状态，
+		// 不再靠"另外一张投影表"来表达"它被用掉了"。
+		ApplyOccupancy();
+
+		var activeRows = BuildVisibleAvailableRows();
 		if (forceReplaceActiveTab || !AreSameReferences(AvailableArmors, activeRows))
 			AvailableArmors.ReplaceWith(activeRows, ListTransitionKind.Replace);
 
-		RaiseTabHeaderPropertiesChanged();
+		RefreshSearchFilterState();
 		OnPropertyChanged(nameof(AvailableSummary));
+	}
+
+	// 把"谁在被占用"标到行上：视觉来源（来源表 / 任何映射的来源 / 素体）与已映射的目标。
+	// 这是右侧表唯一的"占用"表达——规划器那边已经不再删行、不再置灰。
+	private void ApplyOccupancy()
+	{
+		var sourceMemberIds = new HashSet<uint>(sourceItemIds);
+		foreach (var model in CustomModels) sourceMemberIds.Add(SyntheticModelItemId(model.Key));
+		foreach (var mapping in Mappings) sourceMemberIds.Add(mapping.Source.ItemId);
+
+		var mappedSourceByTarget = new Dictionary<uint, RuntimeArmorChoiceViewModel>();
+		foreach (var mapping in Mappings)
+			mappedSourceByTarget.TryAdd(mapping.Target.ItemId, mapping.Source);
+
+		// 每个来源名下有几个目标：行上要写"视觉来源 · n 个目标"，n 跟着映射变。
+		var targetCountBySource = new Dictionary<uint, int>();
+		foreach (var mapping in Mappings)
+			targetCountBySource[mapping.Source.ItemId] = targetCountBySource.GetValueOrDefault(mapping.Source.ItemId) + 1;
+
+		foreach (var tab in PickerTabOrder)
+		{
+			foreach (var row in availableChoicesByTab.GetValueOrDefault(tab) ?? [])
+			{
+				var isSource = row.MemberItemIds.Any(sourceMemberIds.Contains);
+				RuntimeArmorChoiceViewModel? mappedSource = null;
+				foreach (var memberId in row.MemberItemIds)
+				{
+					if (!mappedSourceByTarget.TryGetValue(memberId, out var source)) continue;
+					mappedSource = source;
+					break;
+				}
+
+				var targetCount = row.MemberItemIds.Sum(memberId => targetCountBySource.GetValueOrDefault(memberId));
+				row.ApplyOccupancy(isSource, targetCount, mappedSource?.SelectionKey, mappedSource?.Name);
+			}
+		}
 	}
 
 	private void SyncPickerTab(
@@ -1691,7 +1872,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			selectionKeyOverride: plan.SelectionKey,
 			pickerTab: plan.Tab,
 			versionCount: plan.VersionCount,
-			isDemocracyOfficerNpc: plan.IsDemocracyOfficerNpc,
+			isNpc: plan.IsNpc,
 			isBlocked: plan.IsBlocked,
 			blockedReason: plan.BlockedReason);
 		choice.SetPickerPresentation(plan.TypeLabel, plan.IsTwinBundle, plan.TwinSetCount, plan.TwinBundleNote);
@@ -1751,21 +1932,36 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		=> item is RuntimeArmorChoiceViewModel choice
 			&& MatchesSearch(choice, providersSearchText);
 
-	private bool FilterAvailableArmor(object item)
+	public bool FilterAvailableArmor(object item)
 	{
 		if (item is not RuntimeArmorChoiceViewModel choice || !MatchesSearch(choice, availableSearchText))
 			return false;
-		return availableArmorUnitFilter switch
-		{
-			AvailableArmorUnitFilter.HasEffectiveUnitOverride => choice.HasEffectiveUnitOverride == true,
-			AvailableArmorUnitFilter.NoEffectiveUnitOverride => choice.HasEffectiveUnitOverride == false,
-			_ => true,
-		};
+		if (!IsUnitOverrideFilterActive) return true;
+		if (unitOverrideHitFilter && choice.HasEffectiveUnitOverride == true) return true;
+		if (unitOverrideMissFilter && choice.HasEffectiveUnitOverride == false) return true;
+		return false;
 	}
 
 	private bool FilterProviderDetailItem(object item)
 		=> item is RuntimeArmorChoiceViewModel choice
 			&& MatchesSearch(choice, providerDetailSearchText);
+
+	private RuntimeArmorCatalogEntry[] ResolveTargetCatalogEntries(IEnumerable<uint> targetIds)
+		=> targetIds
+			.Select(id =>
+			{
+				if (cachedCatalogById.TryGetValue(id, out var catalogEntry))
+					return catalogEntry;
+				var fallback = ResolveChoice(id);
+				return new RuntimeArmorCatalogEntry(
+					id,
+					fallback.ArchiveId,
+					fallback.Name,
+					fallback.KitKind,
+					fallback.SetId,
+					fallback.DlcId);
+			})
+			.ToArray();
 
 	private static bool MatchesSearch(RuntimeArmorChoiceViewModel choice, string query)
 	{
@@ -1774,6 +1970,10 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			|| choice.Name.Contains(term, StringComparison.CurrentCultureIgnoreCase)
 			|| choice.ArchiveId.Contains(term, StringComparison.OrdinalIgnoreCase)
 			|| choice.ItemIdText.Contains(term, StringComparison.OrdinalIgnoreCase)
+			|| (!string.IsNullOrEmpty(choice.MappedProviderName)
+				&& choice.MappedProviderName.Contains(term, StringComparison.CurrentCultureIgnoreCase))
+			// 民主官 NPC 的名字就是 FS-05 的名字，行上显示的「民主官 NPC」标签也要能搜到。
+			|| (choice.IsNpc && (KitNonPlayerArmors.NpcTag(choice.ItemId) ?? string.Empty).Contains(term, StringComparison.CurrentCultureIgnoreCase))
 			|| choice.MemberItemIds.Any(id => id.ToString(CultureInfo.InvariantCulture).Contains(term, StringComparison.OrdinalIgnoreCase));
 	}
 
@@ -1865,7 +2065,8 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			mappings,
 			CustomModels.Select(model => model.ToDomain()).ToArray(),
 			pieceOverrides,
-			targetModes);
+			targetModes,
+			SourceItems: sourceItemIds.OrderBy(id => id).ToArray());
 	}
 
 
@@ -1929,7 +2130,6 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		CustomModels.Remove(model);
 		Choices.Remove(syntheticId);
 		foreach (var mapping in removed) Mappings.Remove(mapping);
-		pendingProviderIds.Remove(syntheticId);
 		pieceOverrides = pieceOverrides.Where(item => !released.Contains(item.OwnerItemId)).ToArray();
 		targetModes = targetModes.Where(item => !released.Contains(item.TargetItemId)).ToArray();
 		selection.Clear();
@@ -1969,6 +2169,18 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		target.SetLowPollutionMark(blocked.Status == "not-deployed" ? "未部署" : "低污染模式下不可", blocked.Reason);
 	}
 
+	/// <summary>有素体的 NPC 专用 unit 和现在的映射对不上（没人用了要清，缺了要补）：低污染开着才有意义。</summary>
+	private bool HasLeftoverNpcUnits(IReadOnlyList<RuntimeArmorRegistryMapping> desired)
+	{
+		var modsDirectory = SettingsService.CreateStoragePaths().ModsDirectory;
+		return SettingsService.GetEffectiveLowPollutionMode()
+			? LowPollutionFreshness.AnyNpcVariantMismatch(
+				modsDirectory,
+				LowPollutionFreshness.SourceModelKeys(Enabled, desired),
+				LowPollutionFreshness.NpcItemIdsByModel(Enabled ? desired : []))
+			: LowPollutionFreshness.LeftoverNpcModelKeys(modsDirectory, [], nativeOnly: true).Count != 0;
+	}
+
 	/// <summary>
 	/// 低污染映射前的素体准备（规划 §12.1）：只看这次映射用到的素体，逐个判断是不是当前设置下的最新产物，
 	/// 只对需要的重编（走详情页「切换」那条 <see cref="ModCompileService.CompileAsync"/>，目标是自己的素体）。
@@ -1979,22 +2191,31 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 	{
 		var empty = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 		// 只有被某条映射关联的素体才进判断；只列在左边、没有任何目标的素体不编译。
-		var keys = LowPollutionFreshness.SourceModelKeys(Enabled, desired);
-		if (keys.Count == 0) return empty;
-
+		var sourceKeys = LowPollutionFreshness.SourceModelKeys(Enabled, desired);
 		var paths = SettingsService.CreateStoragePaths();
 		var lowPollution = SettingsService.GetEffectiveLowPollutionMode();
+		// 飞船 NPC（女舰长、维修技术员）的专用 unit 只为「映射了 NPC 的素体」生成：按素体归拢这次映射里的 NPC。
+		var npcByModel = LowPollutionFreshness.NpcItemIdsByModel(Enabled && lowPollution ? desired : []);
+		var seafSources = npcByModel.Where(pair => pair.Value.Contains(KitNpcRecords.SeafSoldierItemId)).Select(pair => pair.Key).ToArray();
+		var staleSeafKeys = LowPollutionFreshness.LeftoverNpcModelKeys(paths.ModsDirectory, seafSources, nativeOnly: true)
+			.ToHashSet(StringComparer.OrdinalIgnoreCase);
+		// 以前给 NPC 生成过专用 unit、现在已经没有映射引用的素体：也要判断一次，重编时把它们清掉（NPC 的资源只留一份）。
+		var leftoverKeys = lowPollution ? LowPollutionFreshness.LeftoverNpcModelKeys(paths.ModsDirectory, sourceKeys) : [];
+		var keys = staleSeafKeys.Concat(sourceKeys).Concat(leftoverKeys).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+		if (keys.Length == 0) return empty;
 		var nodes = library.Snapshot.Nodes.Values.ToArray();
 		ModNode? NodeOf(string modDirectory) => nodes.FirstOrDefault(candidate => string.Equals(
 			Path.GetFullPath(Path.Combine(library.ModsRootDirectory, candidate.RelativePath)).TrimEnd('\\', '/'),
 			Path.GetFullPath(modDirectory).TrimEnd('\\', '/'),
 			StringComparison.OrdinalIgnoreCase));
 		// 提示里要写用户认得的 Mod 名：文件夹名常常只是一串创意工坊编号（2026-11-14 用户看不出是谁出错）。
-		var items = (await LowPollutionFreshness.PlanAsync(paths.ModsDirectory, keys, lowPollution).ConfigureAwait(true))
+		var items = (await LowPollutionFreshness.PlanAsync(paths.ModsDirectory, keys, lowPollution, npcByModel: npcByModel).ConfigureAwait(true))
 			.Select(item => NodeOf(item.ModDirectory)?.Metadata.Name is { Length: > 0 } displayName ? item with { Name = displayName } : item)
 			.ToList();
 		var need = items.Where(item => item.Status == LowPollutionPrepStatus.NeedsRecompile).ToArray();
 		var blocked = items.Where(item => item.Status == LowPollutionPrepStatus.Blocked).ToArray();
+		if (blocked.FirstOrDefault(item => staleSeafKeys.Contains(item.ModelKey)) is { } oldSeaf)
+			throw new InvalidOperationException($"无法清理 {oldSeaf.Name} 中上一次的 SEAF 补丁。{oldSeaf.Reason}");
 		if (need.Length == 0 && blocked.Length == 0) return empty;
 
 		var skipped = new HashSet<string>(blocked.Select(item => item.ModelKey), StringComparer.OrdinalIgnoreCase);
@@ -2029,20 +2250,32 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		StatusTitle = "正在重编素体";
 
 		var changedNodes = new List<ModNodeId>();
+		var pendingSeafCleanup = need.Where(item => staleSeafKeys.Contains(item.ModelKey))
+			.Select(item => item.ModelKey).ToHashSet(StringComparer.OrdinalIgnoreCase);
 		var result = await LowPollutionRecompiler.RunAsync(
 			items,
 			async (item, token) =>
 			{
+				if (pendingSeafCleanup.Count != 0 && seafSources.Contains(item.ModelKey, StringComparer.OrdinalIgnoreCase))
+					return (false, "上一份 SEAF 补丁还在，先清理旧补丁才能切换素体。");
 				var node = NodeOf(item.ModDirectory);
 				var outcome = await ModCompileService.CompileAsync(
 					node is null ? Path.GetFileName(item.ModDirectory.TrimEnd('\\', '/')) : node.Id.Value.ToString("N"),
 					item.ModDirectory,
-					SettingsService.CreateVpkHostContext(),
+					// 只给映射到这个素体的 NPC 生成专用 unit；没映射（或取消了）就是空，编译产物里不留 NPC 资源。
+					SettingsService.CreateVpkHostContext(item.Name) with
+					{
+						NpcItemIds = npcByModel.TryGetValue(item.ModelKey, out var mappedNpcs) ? [.. mappedNpcs.Order()] : [],
+					},
 					[RuntimeArmorRegistryService.CustomModelArchiveId(item.ModelKey)],
 					null,
 					stage => task?.UpdateStage($"{item.Name}：{stage}"),
 					token).ConfigureAwait(true);
-				if (outcome.Ok && node is not null) changedNodes.Add(node.Id);
+				if (outcome.Ok)
+				{
+					pendingSeafCleanup.Remove(item.ModelKey);
+					if (node is not null) changedNodes.Add(node.Id);
+				}
 				return (outcome.Ok, outcome.Error ?? "编译失败。");
 			},
 			(index, total, item) =>
@@ -2081,6 +2314,8 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 		LogService.Info("低污染模式：" + summary);
 		if (result.Failed.Count > 0) task?.MarkFailed(summary); else task?.MarkCompleted();
 		notifications.Show(summary, result.Failed.Count == 0 ? NotificationLevel.Info : NotificationLevel.Warning, TimeSpan.FromSeconds(16), "护甲注册");
+		if (result.Failed.FirstOrDefault(failure => staleSeafKeys.Contains(failure.Item.ModelKey)) is { Item: { } staleSeaf, Error: var cleanupError })
+			throw new InvalidOperationException($"无法清理 {staleSeaf.Name} 中上一次的 SEAF 补丁。{cleanupError}");
 		return skipped;
 	}
 
@@ -2108,7 +2343,10 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 				.ToArray();
 			// 低污染模式（规划 §12.1）：先把这次用到、且还不是最新的素体重编好，再走原来的「先部署后映射」。
 			IReadOnlySet<string> skippedModels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-			if (Enabled && desired.Any(mapping => mapping.IsModelMapping))
+			// 取消了 NPC 映射（或关了映射）后，素体里留着的 NPC 专用 unit 也要清掉：没人用的资源不留在补丁里。
+			var hasLeftoverNpcUnits = HasLeftoverNpcUnits(desired);
+			var prepareModels = (Enabled && desired.Any(mapping => mapping.IsModelMapping)) || hasLeftoverNpcUnits;
+			if (prepareModels)
 			{
 				var prepared = await PrepareSourceModelsAsync(desired).ConfigureAwait(true);
 				if (prepared is null)
@@ -2119,7 +2357,7 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 				}
 				skippedModels = prepared;
 			}
-			if (!IsGameRunning() && Enabled && desired.Any(mapping => mapping.IsModelMapping))
+			if (!IsGameRunning() && prepareModels)
 			{
 				var deployment = await deploymentCoordinator.FlushAsync();
 				if (deployment.Stage != ProfileDeploymentStage.Completed)
@@ -2194,7 +2432,6 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			baselineEnabled = Enabled;
 			baselineMappings = GetMappingKeys();
 			HasChanges = false;
-			pendingProviderIds.Clear();
 			if (selectedProviderId is not null && !selectedProviderMemberIds.Any(sourceIds.Contains))
 			{
 				selectedProviderId = null;
@@ -2289,6 +2526,13 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 				}
 			}
 		}
+		catch (UndeployedMappedModelsException exception)
+		{
+			notifications.Show($"应用护甲注册失败：{exception.Message}", NotificationLevel.Error, TimeSpan.FromSeconds(10), "护甲注册");
+			StatusTitle = "应用失败";
+			StatusDetail = exception.Message;
+			OfferClearUndeployedMappedModels(exception);
+		}
 		catch (Exception exception) when (exception is IOException
 			or UnauthorizedAccessException
 			or InvalidDataException
@@ -2304,6 +2548,46 @@ public sealed class ArmorRegistryPageViewModel : FullWorkspacePageViewModel
 			// 应用结束进入 10 秒冷却；冷却结束后按钮重新可用（即便没有新的改动）。
 			_ = RunApplyCooldownAsync();
 		}
+	}
+
+	private void OfferClearUndeployedMappedModels(UndeployedMappedModelsException exception)
+	{
+		if (exception.ModelKeys.Count == 0) return;
+		var keySet = exception.ModelKeys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+		var lines = new List<string>(exception.ModelKeys.Count);
+		for (var i = 0; i < exception.ModelKeys.Count; i++)
+		{
+			var key = exception.ModelKeys[i];
+			var name = i < exception.ModelNames.Count ? exception.ModelNames[i] : key;
+			var count = Mappings.Count(row => row.Source.IsCustomModel && string.Equals(row.Source.ModelKey, key, StringComparison.OrdinalIgnoreCase));
+			lines.Add($"• {name}（映射了 {count} 件护甲）");
+		}
+
+		var message = "以下自定义素体在游戏目录里没有已部署的 Unit，导致无法应用护甲映射：\n\n"
+			+ string.Join("\n", lines)
+			+ "\n\n是否立即清理这些未部署素体的映射？\n"
+			+ "（选「是」会移除它们的映射并保存；如果这些素体还在模组库里只是还没启用或部署，请选「否」先去启用并部署。）";
+
+		if (Views.AppDialog.Show(message, "未部署的素体映射", System.Windows.MessageBoxButton.YesNo, System.Windows.MessageBoxImage.Warning) != System.Windows.MessageBoxResult.Yes)
+			return;
+
+		var removed = Mappings.Where(row => row.Source.IsCustomModel && row.Source.ModelKey is not null && keySet.Contains(row.Source.ModelKey)).ToArray();
+		if (removed.Length == 0) return;
+
+		var released = removed.Select(row => row.Target.ItemId).ToHashSet();
+		foreach (var key in keySet)
+		{
+			var syntheticId = SyntheticModelItemId(key);
+			if (selectedProviderId == syntheticId) CloseProvider();
+		}
+		foreach (var mapping in removed) Mappings.Remove(mapping);
+		targetModes = targetModes.Where(item => !released.Contains(item.TargetItemId)).ToArray();
+		selection.Clear();
+		RebuildProjections();
+		MarkModelDefinitionsDirty();
+		StatusTitle = "已清理未部署映射";
+		StatusDetail = $"已移除 {removed.Length} 条未部署素体的映射，请重新点击「应用」。";
+		notifications.Show(StatusDetail, NotificationLevel.Info, TimeSpan.FromSeconds(8), "护甲注册");
 	}
 
 	private async Task<RuntimeArmorRegistrySnapshot> WaitForRuntimeAsync(int revision)
@@ -2435,7 +2719,7 @@ public sealed class RuntimeArmorChoiceViewModel : BaseViewModel, IModListSelecta
 		string? selectionKeyOverride = null,
 		ArmorMappingPickerTab? pickerTab = null,
 		int versionCount = 1,
-		bool isDemocracyOfficerNpc = false,
+		bool isNpc = false,
 		bool isBlocked = false,
 		string? blockedReason = null)
 	{
@@ -2455,7 +2739,7 @@ public sealed class RuntimeArmorChoiceViewModel : BaseViewModel, IModListSelecta
 		this.selectionKeyOverride = selectionKeyOverride;
 		PickerTab = pickerTab;
 		VersionCount = versionCount;
-		IsDemocracyOfficerNpc = isDemocracyOfficerNpc;
+		IsNpc = isNpc;
 		this.isBlocked = isBlocked;
 		this.blockedReason = blockedReason;
 	}
@@ -2469,6 +2753,7 @@ public sealed class RuntimeArmorChoiceViewModel : BaseViewModel, IModListSelecta
 	public bool IsCustomModel { get; }
 	// 自定义素体没有"解除"（它本来就不在映射里），普通护甲没有"重命名"。
 	// 这条规则以前散在面板 XAML 的转换器里。
+	// 被占用的行（来源 / 已映射目标）**不再**因此屏蔽「注册」：把来源改成另一个来源的目标是有效操作。
 	public ModListRowAction HiddenActions => IsCustomModel
 		? ModListRowAction.ArmorRelease
 		: ModListRowAction.ArmorRenameCustomModel;
@@ -2491,7 +2776,7 @@ public sealed class RuntimeArmorChoiceViewModel : BaseViewModel, IModListSelecta
 	public IReadOnlyList<uint> ProviderSourceItemIds => providerSourceItemIds;
 	public ArmorMappingPickerTab? PickerTab { get; }
 	public int VersionCount { get; }
-	public bool IsDemocracyOfficerNpc { get; }
+	public bool IsNpc { get; }
 	public bool IsBlocked { get => isBlocked; private set => SetField(ref isBlocked, value); }
 	public string? BlockedReason { get => blockedReason; private set => SetField(ref blockedReason, value); }
 	public bool IsCombined => memberItemIds.Count > 1;
@@ -2502,8 +2787,56 @@ public sealed class RuntimeArmorChoiceViewModel : BaseViewModel, IModListSelecta
 	public bool IsDecoration => false;
 	public string Display => $"{Name} · {ArchiveId}";
 	public string ItemIdText => ItemId.ToString(CultureInfo.InvariantCulture);
+	public string? MappedProviderKey { get; private set; }
+	public string? MappedProviderName { get; private set; }
+	// 占用状态：这一行是不是视觉来源、有没有被映射到某个来源。
+	// 右侧表用它们决定"默认隐不隐藏"，而不是靠另做一张投影表。
+	public bool IsSource { get; private set; }
+	public bool IsMapped => MappedProviderKey is not null;
+	public bool IsHidden => IsSource || IsMapped;
 	public bool IsSelected { get => isSelected; set => SetField(ref isSelected, value); }
 	public ModListRowPresentation RowPresentation { get => rowPresentation; private set => SetField(ref rowPresentation, value); }
+
+	private int sourceTargetCount;
+
+	/// <summary>
+	/// 记下这一行的占用状态，并把它写进行摘要那一条补充说明里。
+	/// 为什么放在内存里临时算：这些行默认是隐藏的，只有点亮「已映射」才看得见；
+	/// 而状态来源（来源表 + 映射）本来就每次刷新都在手上，落盘或另建索引都是多余的。
+	/// </summary>
+	public void ApplyOccupancy(bool isSource, int sourceTargetCount, string? providerKey, string? providerName)
+	{
+		var occupancy = BuildOccupancyLabel(isSource, sourceTargetCount);
+		var mapping = string.IsNullOrWhiteSpace(providerName) ? null : $"已映射到：{providerName}";
+		if (IsSource == isSource
+			&& this.sourceTargetCount == sourceTargetCount
+			&& string.Equals(MappedProviderKey, providerKey, StringComparison.Ordinal)
+			&& string.Equals(RowPresentation.OccupancyLabel, occupancy, StringComparison.Ordinal)
+			&& string.Equals(RowPresentation.MappingLabel, mapping, StringComparison.Ordinal))
+			return;
+
+		IsSource = isSource;
+		this.sourceTargetCount = sourceTargetCount;
+		MappedProviderKey = providerKey;
+		MappedProviderName = providerName;
+		RowPresentation = RowPresentation with
+		{
+			// 两者都靠右：左边回答"这一行是什么"，右边回答"它挂在谁身上"。
+			OccupancyLabel = occupancy,
+			OccupancyTone = ModListRowTone.Success,
+			MappingLabel = mapping,
+			MappingTone = ModListRowTone.Accent,
+		};
+		OnPropertyChanged(nameof(IsSource));
+		OnPropertyChanged(nameof(IsMapped));
+		OnPropertyChanged(nameof(IsHidden));
+	}
+
+	private static string? BuildOccupancyLabel(bool isSource, int targetCount)
+		=> isSource
+			? targetCount == 0 ? "视觉来源 · 尚无映射目标" : $"视觉来源 · {targetCount} 个目标"
+			: null;
+
 
 	private string? lowPollutionWarning;
 	private string? lowPollutionNote;
@@ -2511,12 +2844,44 @@ public sealed class RuntimeArmorChoiceViewModel : BaseViewModel, IModListSelecta
 	private int twinSetCount;
 	private string? twinBundleNote;
 
+	private string? BuildActivationLabel(bool twinBundle, int twinCount)
+		=> IsNpc
+			? KitNonPlayerArmors.NpcTag(ItemId) ?? "NPC"
+			: twinBundle
+				? (VersionCount > 1 ? $"换色孪生 · {twinCount} 套 · {VersionCount} 个版本" : $"换色孪生 · {twinCount} 套")
+				: VersionCount > 1
+					? $"{VersionCount} 个版本"
+					: null;
+
 	/// <summary>低污染模式下的标注（警告标签 + 原因）；传 <c>null</c> 清除。</summary>
 	public void SetLowPollutionMark(string? warning, string? note)
 	{
 		lowPollutionWarning = warning;
 		lowPollutionNote = note;
 		RowPresentation = RowPresentation with { WarningLabel = warning, Note = note ?? twinBundleNote };
+	}
+
+	public void SetMappedOverviewPresentation(
+		string providerKey,
+		string providerName,
+		string typeLabel,
+		bool isTwinBundle = false,
+		int twinSetCount = 0,
+		string? twinBundleNote = null)
+	{
+		MappedProviderKey = providerKey;
+		MappedProviderName = providerName;
+		pickerTypeLabel = typeLabel;
+		this.isTwinBundle = isTwinBundle;
+		this.twinSetCount = twinSetCount;
+		this.twinBundleNote = twinBundleNote;
+		var summary = $"已映射到：{providerName}";
+		RowPresentation = new ModListRowPresentation(
+			TypeLabel: typeLabel,
+			TypeTone: ModListRowTone.Accent,
+			ActivationLabel: BuildActivationLabel(isTwinBundle, twinSetCount),
+			Summary: summary,
+			Note: twinBundleNote ?? summary);
 	}
 
 	public void SetPickerPresentation(
@@ -2529,13 +2894,7 @@ public sealed class RuntimeArmorChoiceViewModel : BaseViewModel, IModListSelecta
 		this.isTwinBundle = isTwinBundle;
 		this.twinSetCount = twinSetCount;
 		this.twinBundleNote = twinBundleNote;
-		var activation = IsDemocracyOfficerNpc
-			? ArmorMappingPickerPlanner.DemocracyOfficerTag
-			: isTwinBundle
-				? (VersionCount > 1 ? $"换色孪生 · {twinSetCount} 套 · {VersionCount} 个版本" : $"换色孪生 · {twinSetCount} 套")
-				: VersionCount > 1
-					? $"{VersionCount} 个版本"
-					: null;
+		var activation = BuildActivationLabel(isTwinBundle, twinSetCount);
 		if (IsBlocked)
 		{
 			RowPresentation = new ModListRowPresentation(

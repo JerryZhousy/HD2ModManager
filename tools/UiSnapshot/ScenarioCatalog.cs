@@ -34,6 +34,7 @@ internal static class ScenarioCatalog
         ["modlist-empty-search"] = () => ModListScenario.Build("modlist-empty-search", ModListScenario.Variant.EmptySearch),
         ["modlist-empty-search-derived"] = () => ModListScenario.Build("modlist-empty-search-derived", ModListScenario.Variant.EmptySearchDerived),
         ["rowaction-probe"] = () => ModListScenario.BuildRowActionProbe("rowaction-probe"),
+        ["occupancy-probe"] = () => ModListScenario.BuildOccupancyProbe("occupancy-probe"),
         ["relationship-drop-probe"] = () => ModListScenario.BuildRelationshipDropProbe("relationship-drop-probe"),
         ["cards"] = () => CardScenario.Build("cards", midInsert: false),
         ["cards-insert"] = () => CardScenario.Build("cards-insert", midInsert: true),
@@ -70,6 +71,11 @@ internal static class ScenarioCatalog
         ["tree-keys"] = () => TreeScenario.BuildKeys("tree-keys"),
         ["tree-fan"] = () => TreeScenario.BuildFan("tree-fan"),
         ["tree-fan-settled"] = () => TreeScenario.BuildFanSettled("tree-fan-settled"),
+        // 标题卡的"标题 / 搜索 / 搜索+标签 / 窄宽度"四种静态状态。
+        ["header-title"] = () => HeaderSearchScenario.Build("header-title", HeaderSearchScenario.Variant.Title),
+        ["header-search-empty"] = () => HeaderSearchScenario.Build("header-search-empty", HeaderSearchScenario.Variant.SearchEmpty),
+        ["header-search-tags"] = () => HeaderSearchScenario.Build("header-search-tags", HeaderSearchScenario.Variant.SearchTags),
+        ["header-search-narrow"] = () => HeaderSearchScenario.Build("header-search-narrow", HeaderSearchScenario.Variant.SearchNarrow),
     };
 
     public static IEnumerable<string> Names => Factories.Keys;

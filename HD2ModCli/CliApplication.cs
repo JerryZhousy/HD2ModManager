@@ -1,5 +1,8 @@
+using System.Globalization;
+using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
+using HD2ModAdaptation.PatchReconstruction.UnitMesh.Canonical;
 using HD2ModCore.Application;
 using AdaptationAssetKey = HD2ModAdaptation.PatchReconstruction.AssetKey;
 using HD2ModCore.Domain;
@@ -223,7 +226,9 @@ public static class CliApplication
 					ok = adoption.Outcomes.All(outcome => outcome.Status != ExternalPackageAdoptionStatus.Failed),
 					library = adoptRoot,
 					adopted = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Adopted),
+					queued = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Queued),
 					failed = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Failed),
+					notes = adoption.Notes,
 					outcomes = adoption.Outcomes,
 				},
 				() => FormatLibraryAdoption(adoptRoot, adoption));
@@ -1535,6 +1540,112 @@ public static class CliApplication
 				new { ok = hidden.Success, hideUnit = hidden },
 				() => $"已生成 {hidden.AffectedEntryCount} 个隐藏 Unit 的新 Patch：{hidden.OutputDirectory}");
 			return hidden.Success ? 0 : 2;
+		}
+		if (command.Length >= 2 && command[0] == "patch" && command[1] == "primitive")
+		{
+			EnsurePatchPrimitiveExportOptions(invocation.Options, "patch primitive");
+			if (command.Length < 5)
+				throw new CliUserException(
+					"InvalidArguments",
+					"patch primitive <源 patch.toc> <形状> <尺寸> [xy|yz] [x,y,z] [static] --keys <unit 列表> --output <目录> [--overwrite] [--json]\n" +
+					"  形状：tri | quad | cube | sphere\n" +
+					"  尺寸：quad/tri 用 \"宽,高\"；cube 用 \"边长\"；sphere 用 \"半径\"（单位：米）\n" +
+					"  yz   ：四边形落在 X=0 平面（宽沿 Y、高沿 Z，法线朝 +X）\n" +
+					"  x,y,z：中心点（默认 0,0,0）\n" +
+					"  static：不绑骨（骨骼权重全 0）");
+			var primitiveSource = command[2];
+			var shape = command[3].ToLowerInvariant() switch
+			{
+				"tri" or "triangle" => CanonicalPrimitiveShape.Triangle,
+				"quad" => CanonicalPrimitiveShape.Quad,
+				"cube" => CanonicalPrimitiveShape.Cube,
+				"sphere" => CanonicalPrimitiveShape.Sphere,
+				_ => throw new CliUserException("PatchPrimitiveShapeInvalid", $"不认识的形状：{command[3]}（tri | quad | cube | sphere）")
+			};
+			var sizeParts = command[4].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+			if (sizeParts.Length == 0 ||
+				!float.TryParse(sizeParts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var sizeWidth) ||
+				sizeWidth <= 0)
+				throw new CliUserException("PatchPrimitiveSizeInvalid", $"尺寸无法解析：{command[4]}（示例：0.15,0.15 或 0.3）");
+			var sizeHeight = sizeWidth;
+			if (sizeParts.Length > 1 &&
+				(!float.TryParse(sizeParts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out sizeHeight) || sizeHeight <= 0))
+				throw new CliUserException("PatchPrimitiveSizeInvalid", $"尺寸无法解析：{command[4]}");
+			var primitivePlane = CanonicalPrimitivePlane.Xy;
+			var primitiveCenter = Vector3.Zero;
+			var primitiveNoSkin = false;
+			ulong? primitiveMaterialId = null;
+			float primitiveBackdropScale = 0f;
+			float primitiveBackdropOffsetY = 0f;
+			for (var extra = 5; extra < command.Length; extra++)
+			{
+				var token = command[extra];
+				if (string.Equals(token, "xy", StringComparison.OrdinalIgnoreCase) ||
+					string.Equals(token, "yz", StringComparison.OrdinalIgnoreCase) ||
+					string.Equals(token, "xz", StringComparison.OrdinalIgnoreCase))
+				{
+					primitivePlane = token.ToLowerInvariant() switch
+					{
+						"yz" => CanonicalPrimitivePlane.Yz,
+						"xz" => CanonicalPrimitivePlane.Xz,
+						_ => CanonicalPrimitivePlane.Xy
+					};
+					continue;
+				}
+				if (string.Equals(token, "static", StringComparison.OrdinalIgnoreCase))
+				{
+					primitiveNoSkin = true;
+					continue;
+				}
+				if (token.StartsWith("backdy=", StringComparison.OrdinalIgnoreCase))
+				{
+					var rawDy = token.Substring(7);
+					if (!float.TryParse(rawDy, NumberStyles.Float, CultureInfo.InvariantCulture, out var dyValue))
+						throw new CliUserException("PatchPrimitiveBackdropInvalid", $"背景板横向偏移无法解析：{token}");
+					primitiveBackdropOffsetY = dyValue;
+					continue;
+				}
+				if (token.StartsWith("back=", StringComparison.OrdinalIgnoreCase))
+				{
+					var rawBack = token.Substring(5);
+					if (!float.TryParse(rawBack, NumberStyles.Float, CultureInfo.InvariantCulture, out var backScale) || backScale <= 0)
+						throw new CliUserException("PatchPrimitiveBackdropInvalid", $"背景板倍数无法解析：{token}（示例 back=1.25）");
+					primitiveBackdropScale = backScale;
+					continue;
+				}
+				if (token.StartsWith("mat=", StringComparison.OrdinalIgnoreCase))
+				{
+					var rawMaterial = token.Substring(4);
+					var hex = rawMaterial.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? rawMaterial.Substring(2) : rawMaterial;
+					if (!ulong.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var parsedMaterial))
+						throw new CliUserException("PatchPrimitiveMaterialInvalid", $"材质 id 无法解析：{token}（示例 mat=0x1234abcd5678ef90）");
+					primitiveMaterialId = parsedMaterial;
+					continue;
+				}
+				var centerParts = token.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+				if (centerParts.Length == 3 &&
+					float.TryParse(centerParts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var cx) &&
+					float.TryParse(centerParts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var cy) &&
+					float.TryParse(centerParts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var cz))
+				{
+					primitiveCenter = new Vector3(cx, cy, cz);
+					continue;
+				}
+				throw new CliUserException("PatchPrimitiveArgumentInvalid", $"无法识别的参数：{token}（可用：xy | yz | x,y,z | static）");
+			}
+			var primitiveSpec = new CanonicalPrimitiveSpec(
+				shape, sizeWidth, sizeHeight, Depth: 0f, Center: primitiveCenter, Segments: 12,
+				Plane: primitivePlane, NoSkin: primitiveNoSkin, MaterialId: primitiveMaterialId,
+				BackdropScale: primitiveBackdropScale, BackdropOffsetY: primitiveBackdropOffsetY);
+			var primitiveKeys = CliPatchPrimitives.ResolveKeys(invocation.Options.Keys, "patch primitive --keys");
+			var placed = await CliPatchPrimitives.PlacePrimitiveAsync(
+				primitiveSource, primitiveKeys, primitiveSpec,
+				RequireOutput(invocation.Options, "patch primitive"),
+				invocation.Options.Overwrite).ConfigureAwait(false);
+			Emit(invocation.Options,
+				new { ok = placed.Success, primitive = placed, shape = shape.ToString(), width = sizeWidth, height = sizeHeight },
+				() => $"已把 {placed.AffectedEntryCount} 个 Unit 的几何换成 {shape} {sizeWidth}x{sizeHeight}：{placed.OutputDirectory}");
+			return placed.Success ? 0 : 2;
 		}
 		if (command.Length >= 3 && command[0] == "unit" && command[1] == "show")
 		{
@@ -4006,6 +4117,7 @@ public static class CliApplication
 		// 而它的失败现象是"整件身体不见了"——那种失败会把材质的问题一起遮住。
 		var wanted = options.Components;
 		IEnumerable<MeshGroup> selected;
+		IReadOnlyList<MeshGroup> bodyGroupSwitchCandidates;
 		// 切分/合并自己看到的取舍（哪些部位没有固定本体、哪些变体没并进去）。
 		// 这些是"产物看起来正常但模型缺了一块"的唯一线索，必须跟着报告走。
 		//
@@ -4022,16 +4134,19 @@ public static class CliApplication
 				inputs.Geometry, split.Groups, split.VertexRegions);
 			segmentationNotes.AddRange(merged.Notes);
 			selected = merged.Groups;
+			bodyGroupSwitchCandidates = merged.KeptComponents;
 		}
 		else if (wanted.Equals("none", StringComparison.OrdinalIgnoreCase))
 		{
 			segmentationNotes.AddRange(split.Diagnostics);
 			selected = split.Groups.Where(group => group.Kind == MeshGroupKind.BodyPart);
+			bodyGroupSwitchCandidates = [];
 		}
 		else if (wanted.Equals("all", StringComparison.OrdinalIgnoreCase))
 		{
 			segmentationNotes.AddRange(split.Diagnostics);
 			selected = split.Groups;
+			bodyGroupSwitchCandidates = split.Groups;
 		}
 		else
 		{
@@ -4040,6 +4155,8 @@ public static class CliApplication
 				.ToHashSet(StringComparer.OrdinalIgnoreCase);
 			selected = split.Groups.Where(group =>
 				group.Kind == MeshGroupKind.BodyPart || names.Contains(group.Name));
+			bodyGroupSwitchCandidates = split.Groups.Where(group =>
+				group.Kind == MeshGroupKind.Component && names.Contains(group.Name)).ToArray();
 		}
 
 		var selectedGroups = selected.ToArray();
@@ -4286,7 +4403,7 @@ public static class CliApplication
 		return new(full, "model", outputDirectory, inputs.MdlPath, split.Groups.Count,
 			selectedGroups.Length, package, modelKey, displayName, donors, registryError)
 		{
-			BodyGroupSwitches = BuildBodyGroupSwitches(inputs.Model, inputs.Geometry, split.Groups),
+			BodyGroupSwitches = BuildBodyGroupSwitches(inputs.Model, inputs.Geometry, bodyGroupSwitchCandidates),
 		};
 	}
 
@@ -5165,7 +5282,8 @@ public static class CliApplication
 			return string.Join(Environment.NewLine, lines);
 		}
 
-		lines.Add($"发现 {candidates.Count} 个外部包，其中 {adoptable} 个可以认领。加 --confirm 才会真的导入（源目录会移进 .hd2modmanager-trash）。");
+		var archive = AdoptedArchiveOf(libraryRoot);
+		lines.Add($"发现 {candidates.Count} 个外部包，其中 {adoptable} 个可以认领。加 --confirm 才会真的导入（源目录会移到 {archive}，保留 30 天）。");
 		foreach (var candidate in candidates)
 		{
 			var options = candidate.OptionDirectoryNames.Count == 0
@@ -5182,6 +5300,13 @@ public static class CliApplication
 		return string.Join(Environment.NewLine, lines);
 	}
 
+	/// <summary>
+	/// 认领副本目录（<c>&lt;库&gt;.adopted</c>）。规则只写在 <see cref="StoragePaths"/> 里一处，
+	/// 这里借它算一遍——dry-run 阶段还没构造完整的 StoragePaths。
+	/// </summary>
+	private static string AdoptedArchiveOf(string libraryRoot)
+		=> new StoragePaths(libraryRoot, libraryRoot).AdoptedArchiveDirectory;
+
 	/// <summary>认领执行完的结论：成功的说清搬了哪几个，失败的把原因和「源目录还在」讲明白。</summary>
 	private static string FormatLibraryAdoption(string libraryRoot, ExternalPackageAdoptionResult adoption)
 	{
@@ -5193,14 +5318,19 @@ public static class CliApplication
 		}
 
 		var adopted = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Adopted);
+		var queued = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Queued);
 		var skipped = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Skipped);
 		var failed = adoption.Outcomes.Count(outcome => outcome.Status == ExternalPackageAdoptionStatus.Failed);
-		lines.Add($"认领完成：导入 {adopted} 个，跳过 {skipped} 个，失败 {failed} 个。");
+		// 「排队」与「跳过」分开报：前者只是没轮到，下次继续；后者是被判据挡下了。
+		lines.Add($"认领完成：导入 {adopted} 个，排队 {queued} 个，跳过 {skipped} 个，失败 {failed} 个。");
+		foreach (var note in adoption.Notes)
+			lines.Add($"  · {note}");
 		foreach (var outcome in adoption.Outcomes)
 		{
 			var mark = outcome.Status switch
 			{
 				ExternalPackageAdoptionStatus.Adopted => "+",
+				ExternalPackageAdoptionStatus.Queued => "…",
 				ExternalPackageAdoptionStatus.Skipped => "-",
 				_ => "!",
 			};

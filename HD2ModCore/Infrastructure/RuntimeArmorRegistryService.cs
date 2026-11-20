@@ -160,7 +160,8 @@ public sealed class RuntimeArmorRegistryService
 			[.. document.ModelDefinitions, .. external],
 			document.PieceOverrideDefinitions,
 			document.TargetModeDefinitions,
-			document.CompositionMode);
+			document.CompositionMode,
+			document.SourceItemIds);
 		await SaveWorkspaceAsync(merged, cancellationToken).ConfigureAwait(false);
 		return merged;
 	}
@@ -223,6 +224,22 @@ public sealed class RuntimeArmorRegistryService
 				"ArmorRegistry")
 			: overridePath;
 		return Path.GetFullPath(path);
+	}
+
+	/// <summary>
+	/// 当注册表根是标准的 <c>.../ArmorRegistry</c> 布局时，顺带确保同级 <c>Logs</c> 目录存在。
+	/// 纯净环境或 ProgramData 版 MDL3 不会在真实 <c>%LOCALAPPDATA%\CowboyBingus\Helldivers2</c> 下预先建 <c>Logs</c>，
+	/// 而 Lua 的 <c>io.open(..., 'ab')</c> 不会自动创建父目录。仅在末级目录名为 <c>ArmorRegistry</c> 时创建，避免污染单元测试临时父目录。
+	/// </summary>
+	public static void EnsureSiblingLogsDirectory(string registryRoot)
+	{
+		ArgumentException.ThrowIfNullOrWhiteSpace(registryRoot);
+		var trimmed = Path.TrimEndingDirectorySeparator(Path.GetFullPath(registryRoot));
+		if (!string.Equals(Path.GetFileName(trimmed), "ArmorRegistry", StringComparison.OrdinalIgnoreCase))
+			return;
+		var parent = Path.GetDirectoryName(trimmed);
+		if (!string.IsNullOrEmpty(parent))
+			Directory.CreateDirectory(Path.Combine(parent, "Logs"));
 	}
 
 	/// <summary>素体件表里的 unit 是 16 位十六进制字符串；解析失败表示这条件不可用。</summary>
@@ -401,7 +418,9 @@ public sealed class RuntimeArmorRegistryService
 				merged.Values.OrderBy(model => model.Key, StringComparer.Ordinal).ToArray(),
 				document.PieceOverrideDefinitions,
 				document.TargetModeDefinitions,
-				document.CompositionMode);
+				document.CompositionMode,
+				// 整条重建必须把来源表带上：漏了它，一次读快照就把用户设的游戏来源全抹掉。
+				document.SourceItemIds);
 		}
 		var fingerprint = await FingerprintProtocolAsync(cancellationToken).ConfigureAwait(false);
 		var runtime = await ReadKeyValueFileAsync(runtimePath, cancellationToken).ConfigureAwait(false);
@@ -489,6 +508,7 @@ public sealed class RuntimeArmorRegistryService
 		ValidateModels(models, mappings);
 		// 同 ReadAsync：这三个字段没有在役消费者，不再阻断性校验（见那段注释）。
 		Directory.CreateDirectory(registryRoot);
+		EnsureSiblingLogsDirectory(registryRoot);
 		var lockPath = Path.Combine(registryRoot, ".manager.lock");
 		await using var lease = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
 		var currentFingerprint = await FingerprintProtocolAsync(cancellationToken).ConfigureAwait(false);
@@ -511,17 +531,17 @@ public sealed class RuntimeArmorRegistryService
 			NormalizeModels(models),
 			NormalizePieceOverrides(pieceOverrides),
 			NormalizeTargetModes(targetModes),
-			current.CompositionMode);
+			current.CompositionMode,
+			// 来源表不是"应用"这一侧的输入，它跟着当前文档走：一次应用不该把用户设的来源清空。
+			current.SourceItemIds);
 		// 跳过的素体必须在「已部署 Unit」检查**之前**去掉：被跳过的素体往往正是没部署的那个
 		// （目标不是自己的素体 / 重编失败），留着它，下面的检查会让整次应用失败，其余映射也一起没了。
-		var compiled = skipModelKeys is { Count: > 0 }
-			? desired with
-			{
-				Mappings = desired.Mappings
-					.Where(mapping => !(mapping.IsModelMapping && skipModelKeys.Contains(mapping.ModelKey!)))
-					.ToArray(),
-			}
-			: desired;
+		var compiled = desired with
+		{
+			Mappings = desired.Mappings.Where(mapping =>
+				(mapping.TargetItemId != KitNpcRecords.SeafSoldierItemId || (lowPollutionMode && mapping.IsModelMapping))
+				&& !(mapping.IsModelMapping && skipModelKeys?.Contains(mapping.ModelKey!) == true)).ToArray(),
+		};
 		IReadOnlySet<ulong>? deployedUnits = null;
 		if (gameDataDirectory is not null && compiled.ModelDefinitions.Any(model => model.SourceItemId is null))
 		{
@@ -570,7 +590,11 @@ public sealed class RuntimeArmorRegistryService
 					if (lowPollutionMode && compiled.Enabled)
 					{
 						deployedUnits ??= await RuntimeArmorResourceFilter.ReadDeployedUnitsAsync(gameDataDirectory, cancellationToken).ConfigureAwait(false);
-						lowPollutionPlans = LowPollutionMappingService.Plan(paths.ModsDirectory, authority, compiled.Mappings, deployedUnits);
+						var playerRigs = await PlayerArmorInstanceRigReader.ReadAsync(
+							paths.ModsDirectory, gameDataDirectory, authority, compiled.Mappings, deployedUnits, cancellationToken)
+							.ConfigureAwait(false);
+						lowPollutionPlans = LowPollutionMappingService.Plan(
+							paths.ModsDirectory, authority, compiled.Mappings, deployedUnits, playerRigs);
 					}
 
 					// Hider 规则先于映射行落盘：映射生效时隐藏规则已经就位。没有规则时只在文件已存在才写
@@ -591,7 +615,8 @@ public sealed class RuntimeArmorRegistryService
 					// 否则运行时继续执行旧映射（2026-11-13 实测：协议已关闭，旧 wardrobe.links
 					// 仍把 4 件护甲改指到不存在的 unit，游戏里缺身体）；②才保留上一版。
 					// 只覆盖已存在的文件，没有就不凭空创建。
-					var intentionallyEmpty = compiled.Mappings.Count == 0 || !compiled.Enabled;
+					// SEAF 专用 unit 缺失时移除旧链接，避免指向已被重编清理的资源。
+					var intentionallyEmpty = !compiled.Enabled || compiled.Mappings.All(mapping => mapping.TargetItemId == KitNpcRecords.SeafSoldierItemId);
 					if (links.LinkCount > 0
 						|| (intentionallyEmpty && File.Exists(Path.Combine(registryRoot, WardrobeLinkCompiler.FileName))))
 					{
@@ -709,9 +734,21 @@ public sealed class RuntimeArmorRegistryService
 			NormalizeLegacyHelmetSlots(workspace.Models ?? Array.Empty<RuntimeArmorRegistryModel>()),
 			workspace.PieceOverrides ?? Array.Empty<RuntimeArmorRegistryPieceOverride>(),
 			workspace.TargetModes ?? Array.Empty<RuntimeArmorRegistryTargetMode>(),
-			workspace.CompositionMode);
+			workspace.CompositionMode,
+			workspace.SourceItems);
 		ValidateMappings(document.Mappings);
 		ValidateModels(document.ModelDefinitions, document.Mappings);
+		// 旧工作区没有来源表：用映射行反推一次（素体映射的 SourceItemId 为空，天然被排除）。
+		// 反推能救回"有目标的来源"；"已提升为来源但一个目标都没有"的旧数据本来就没落盘，救不回来。
+		if (workspace.SourceItems is null)
+		{
+			var backfilled = document.Mappings
+				.Where(mapping => mapping.SourceItemId is not null)
+				.Select(mapping => mapping.SourceItemId!.Value)
+				.Distinct()
+				.ToArray();
+			document = document with { SourceItems = backfilled };
+		}
 		// 这三个字段（pieceOverrides / targetModes / compositionMode）**没有任何在役消费者**：
 		// 两条在役链路（真映射走 dl_bin、兼容模式走 wardrobe.links）的签名里都没有它们，
 		// 现网 0 条，唯一读它们的 Lua 因缺 ffi 加载即退出。
@@ -738,7 +775,10 @@ public sealed class RuntimeArmorRegistryService
 			document.ModelDefinitions,
 			document.PieceOverrideDefinitions,
 			document.TargetModeDefinitions,
-			document.CompositionMode);
+			document.CompositionMode,
+			// 空表就写成 null（JsonIgnoreCondition.WhenWritingNull 会整个省掉这个属性），
+			// 让"没有来源表"与"来源表是空的"在文件里长得一样——省掉的分支比多出的分支安全。
+			document.SourceItemIds.Count == 0 ? null : document.SourceItemIds.OrderBy(id => id).ToArray());
 		return JsonSerializer.Serialize(workspace, WorkspaceJsonOptions);
 	}
 
@@ -788,7 +828,9 @@ public sealed class RuntimeArmorRegistryService
 		IReadOnlyList<RuntimeArmorRegistryModel>? Models,
 		IReadOnlyList<RuntimeArmorRegistryPieceOverride>? PieceOverrides,
 		IReadOnlyList<RuntimeArmorRegistryTargetMode>? TargetModes,
-		string CompositionMode = "full");
+		string CompositionMode = "full",
+		// 层 2 的来源表（游戏条目里被指定为视觉来源的那些）。旧文件没有这个字段 ⇒ null ⇒ 反推迁移。
+		IReadOnlyList<uint>? SourceItems = null);
 
 	public static RuntimeArmorRegistryDocument ParseProtocol(string text)
 	{

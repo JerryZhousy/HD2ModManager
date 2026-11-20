@@ -29,15 +29,20 @@ local MAX_BYTES = 4 * 1024 * 1024
 -- 一次写 2000 条会拖住一帧，所以按帧摊开。
 local SET_BUDGET_PER_TICK = 32
 local PROTOCOL_NAME = 'wardrobe.links'
+local SEAF_ROOT_UNIT = '75f7e96af7dcd303'
 
+-- 协议目录与加载器日志目录解耦：MDL3 默认安装到 ProgramData 时会把
+-- CowboyBingusModLoader.log_directory 指到 C:/ProgramData/CowboyBingus/Helldivers2/Logs，
+-- 但管理器始终把 wardrobe.links 写在真实 %LOCALAPPDATA%/CowboyBingus/Helldivers2/ArmorRegistry。
 local function base_directory()
-	local loader = rawget(_G, 'CowboyBingusModLoader')
-	if type(loader) == 'table' and type(loader.log_directory) == 'string' then
-		return loader.log_directory:gsub('[/\\]Logs$', '')
-	end
-	local local_app_data = os.getenv('LOCALAPPDATA')
-	if type(local_app_data) == 'string' and local_app_data ~= '' then
+	local local_app_data = type(os) == 'table' and type(os.getenv) == 'function'
+		and os.getenv('LOCALAPPDATA') or nil
+	if type(local_app_data) == 'string' and local_app_data ~= '' and not local_app_data:find('?', 1, true) then
 		return local_app_data .. '/CowboyBingus/Helldivers2'
+	end
+	local loader = rawget(_G, 'CowboyBingusModLoader')
+	if type(loader) == 'table' and type(loader.log_directory) == 'string' and loader.log_directory ~= '' then
+		return (loader.log_directory:gsub('[/\\]Logs$', ''))
 	end
 	return nil
 end
@@ -45,13 +50,35 @@ end
 local base = base_directory()
 local protocol_path = base and (base .. '/ArmorRegistry/' .. PROTOCOL_NAME) or nil
 local log_path = base and (base .. '/Logs/ArmorOverrideRuntime.log') or nil
+local log_handle = nil
+do
+	local loader = rawget(_G, 'CowboyBingusModLoader')
+	if type(loader) == 'table' and rawget(loader, 'api') == 1 and type(rawget(loader, 'open_log')) == 'function' then
+		local opened, file = pcall(loader.open_log, 'ArmorOverrideRuntime.log')
+		if opened and file then log_handle = file end
+	end
+end
 
 local function log(text)
+	local line = tostring(text) .. '\n'
+	if log_handle ~= nil then
+		pcall(log_handle.write, log_handle, line)
+		if type(log_handle.flush) == 'function' then pcall(log_handle.flush, log_handle) end
+		return
+	end
 	if log_path == nil or type(io) ~= 'table' or not io.open then return end
 	local ok, file = pcall(io.open, log_path, 'ab')
 	if ok and file then
-		pcall(file.write, file, tostring(text) .. '\n')
+		pcall(file.write, file, line)
 		pcall(file.close, file)
+	end
+end
+
+local playerArmor = PlayerArmorInstances and PlayerArmorInstances.new(sr, log)
+if playerArmor then
+	shutdown = function()
+		playerArmor.configure({})
+		pcall(playerArmor.update)
 	end
 end
 
@@ -68,8 +95,8 @@ end
 
 -- 只解析运行时需要的键。任何格式错误都视为"这一版无效"，保留上一版，绝不半应用。
 local function parse(text)
-	local result = { revision = nil, enabled = true, links = {} }
-	local seen = {}
+	local result = { revision = nil, enabled = true, links = {}, instances = {} }
+	local seen, seenInstance = {}, {}
 	for line in text:gmatch('[^\r\n]+') do
 		local trimmed = line:gsub('^%s+', ''):gsub('%s+$', '')
 		if trimmed ~= '' and trimmed:sub(1, 1) ~= '#' then
@@ -88,15 +115,24 @@ local function parse(text)
 					return nil, 'bad link: ' .. trimmed
 				end
 				local key_text = source:lower()
-				if seen[key_text] == nil then
+				-- 旧协议的 SEAF 别名会使引擎按新键查找原版配套资源，生成士兵时闪退。
+				if key_text ~= SEAF_ROOT_UNIT and seen[key_text] == nil then
 					seen[key_text] = true
 					result.links[#result.links + 1] = { source = key_text, target = target:lower() }
 				end
+			elseif key == 'instance' and PlayerArmorInstances then
+				local instance = PlayerArmorInstances.parse(value)
+				if not instance or seenInstance[instance.carrier] then return nil, 'bad player armour instance' end
+				seenInstance[instance.carrier] = true
+				result.instances[#result.instances + 1] = instance
 			end
 			-- map= 是管理器的意图记录，运行时不需要。
 		end
 	end
 	if result.revision == nil then return nil, 'revision missing' end
+	for carrier in pairs(seenInstance) do
+		if seen[carrier] then return nil, 'player armour conflicts with global link' end
+	end
 	return result
 end
 
@@ -170,6 +206,12 @@ local function poll()
 		return
 	end
 	lastText = text
+	if playerArmor then
+		playerArmor.configure(document.enabled and document.instances or {})
+		if #document.instances > 0 and document.enabled then
+			log(string.format('revision=%s player armour instances=%d', tostring(document.revision), #document.instances))
+		end
+	end
 	if not document.enabled then
 		log(string.format('revision=%s disabled: %d overrides stay active until the game restarts',
 			tostring(document.revision), appliedCount))
@@ -183,7 +225,7 @@ local function poll()
 	end
 end
 
-log('runtime loaded; protocol=' .. tostring(protocol_path))
+log('runtime loaded; version=1.1.0 protocol=' .. tostring(protocol_path))
 
 -- 只在「前一个 update 正是按实例隐藏 Hider 装上的钩子」时才接着调用它：
 -- 外置 addon 模式下 Hider 可能先于本运行时加载，整体替换会把它静默顶掉。
@@ -192,6 +234,7 @@ local previousUpdate = rawget(_G, 'update')
 local hiderModule = rawget(_G, 'HD2KitInstanceHider')
 local hiderHook = type(hiderModule) == 'table' and rawget(hiderModule, 'update_hook') or nil
 local chainedHider = (type(previousUpdate) == 'function' and previousUpdate == hiderHook) and previousUpdate or nil
+local lastPlayerArmorError
 
 local function armorUpdate()
 	local okDrain, drainError = pcall(drain)
@@ -205,5 +248,12 @@ end
 
 update = function(...)
 	armorUpdate()
+	if playerArmor then
+		local ok, err = pcall(playerArmor.update)
+		if not ok and err ~= lastPlayerArmorError then
+			log('player armour update failed: ' .. tostring(err))
+		end
+		if ok then lastPlayerArmorError = nil else lastPlayerArmorError = err end
+	end
 	if chainedHider ~= nil then pcall(chainedHider, ...) end
 end

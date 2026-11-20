@@ -1,7 +1,9 @@
 using System.Globalization;
 using System.Text.Json;
+using HD2ModAdaptation.Analysis;
 using HD2ModAdaptation.PatchReconstruction;
 using HD2ModAdaptation.PatchReconstruction.UnitMesh;
+using HD2ModCore.Application;
 using HD2ModCore.Domain;
 using AdaptationAssetKey = HD2ModAdaptation.PatchReconstruction.AssetKey;
 
@@ -126,12 +128,27 @@ public static class Legacy2SectionalConverter
 			var writer = new PatchSubsetWriter();
 
 			// ① unit 组先单独落到一个目录：拆件只吃 unit，材质必须留在外面。
+			//    按来源 patch 分开写出（保留各自文件名序号）：多个来源修改同一个 unit 时，
+			//    同一个 patch 文件容不下多份同 key 条目，分开写才能让拆件器把各来源的拷贝都并进宿主。
 			onStage?.Invoke("正在抽取 unit…");
 			var unitStage = Path.Combine(stagingRoot, "unit-stage");
 			Directory.CreateDirectory(unitStage);
-			var unitWritten = await WriteGroupAsync(writer, modDirectory, unitGroup, unitStage, cancellationToken).ConfigureAwait(false);
-			if (unitWritten is null)
+			var writtenUnitPatches = await WriteUnitPatchesAsync(writer, modDirectory, unitGroup, stagingRoot, unitStage, cancellationToken).ConfigureAwait(false);
+			if (writtenUnitPatches.Count == 0)
 				return Legacy2SectionalOutcome.Failed("写出 unit 组失败：来源里没有任何一个 patch 提供被选中的 unit。", notes);
+
+			await using (var upgradeReader = CoreServices.CreateModInformationReader())
+			{
+				var reconstruction = CoreServices.CreateModSameKeyReconstructionService(context.Paths, upgradeReader);
+				await UpgradeOutdatedStagedUnitPatchesAsync(
+					writtenUnitPatches,
+					stagingRoot,
+					context.GameDataFolder,
+					reconstruction,
+					notes,
+					onStage,
+					cancellationToken).ConfigureAwait(false);
+			}
 
 			// ② 拆 7 槽。输出目录单独给，避免边读边写。
 			onStage?.Invoke("正在按 7 槽拆分…");
@@ -159,11 +176,14 @@ public static class Legacy2SectionalConverter
 			}
 
 			var unitSourceNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+			var patchSourceNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 			foreach (var selection in plan.Unit.Selections)
 			{
-				if (!sourceNameByPatchFile.TryGetValue(Path.GetFileName(selection.SourcePatch), out var display))
+				var patchFileName = Path.GetFileName(selection.SourcePatch);
+				if (!sourceNameByPatchFile.TryGetValue(patchFileName, out var display))
 					continue;
 				unitSourceNames[selection.Key.FileId.ToString("x16", System.Globalization.CultureInfo.InvariantCulture)] = display;
+				patchSourceNames[patchFileName] = display;
 			}
 
 			var splitOutput = Path.Combine(stagingRoot, "unit-split");
@@ -175,7 +195,8 @@ public static class Legacy2SectionalConverter
 					cancellationToken,
 					unitIntents,
 					unitSourceNames,
-					outputUnitIdPrefix: SectionalSplitter.DeriveUnitIdPrefix(modelKey))
+					outputUnitIdPrefix: SectionalSplitter.DeriveUnitIdPrefix(modelKey),
+					patchSourceNames: patchSourceNames)
 				.ConfigureAwait(false);
 			if (!split.IsValid)
 			{
@@ -187,6 +208,15 @@ public static class Legacy2SectionalConverter
 			MoveAs(Path.Combine(splitOutput, split.PatchPath), Path.Combine(producedRoot, $"{archiveHex}.patch_0"));
 			CopyIfExists(splitOutput, producedRoot, WardrobeSectionMapFile.FileName);
 			CopyIfExists(splitOutput, producedRoot, SectionGroupFile.FileName);
+
+			// 物理参数容器（HD2PBX01）也要跟着进产物：从参与 unit 的来源 patch（按后来源优先）搬到 producedRoot 的 patch_0。
+			for (var index = writtenUnitPatches.Count - 1; index >= 0; index--)
+			{
+				var sourcePatchPath = Path.Combine(modDirectory, Path.GetFileName(writtenUnitPatches[index]));
+				if (!File.Exists(sourcePatchPath)) continue;
+				var carry = await PhysBoneCarrier.CarryForwardAsync(sourcePatchPath, producedRoot, cancellationToken).ConfigureAwait(false);
+				if (carry.Applied) break;
+			}
 
 			// ③ 材质组：一组一个 patch，从 patch_1 起向后排。
 			var materialIndex = 1;
@@ -267,10 +297,11 @@ public static class Legacy2SectionalConverter
 			// 位置必须在编译之前：ModCompileService 会把 payload 里的 custom-model.json
 			// 一起带进 Overwrite，与 vpk2patch 的产物形状保持一致。
 			onStage?.Invoke("正在登记自定义素体…");
+			var configuredName = ModSettingsFile.TryRead(modDirectory)?.Name;
 			var definition = SectionalModelDefinition.Build(
 				split.Plan,
 				modelKey,
-				Path.GetFileName(modDirectory));
+				string.IsNullOrWhiteSpace(configuredName) ? Path.GetFileName(modDirectory) : configuredName.Trim());
 			// 一条 piece 都没有就不落盘：空定义比没有定义更糟 —— 它会让"这是一具素体"
 			// 成立却不含任何组件，界面上是一具点了没反应的素体。
 			if (definition.Pieces is { Count: > 0 })
@@ -309,6 +340,116 @@ public static class Legacy2SectionalConverter
 		finally
 		{
 			try { if (Directory.Exists(stagingRoot)) Directory.Delete(stagingRoot, recursive: true); } catch { }
+		}
+	}
+
+	/// <summary>按来源 patch 分开写出 unit 组，保留同名 unit 在各来源里的独立拷贝与文件名序号。</summary>
+	private static async ValueTask<IReadOnlyList<string>> WriteUnitPatchesAsync(
+		PatchSubsetWriter writer,
+		string modDirectory,
+		SectionalPlannedPatch unitGroup,
+		string stagingRoot,
+		string unitStageDirectory,
+		CancellationToken cancellationToken)
+	{
+		var written = new List<string>();
+		var partIndex = 0;
+		foreach (var byPatch in unitGroup.Selections.GroupBy(selection => selection.SourcePatch, StringComparer.OrdinalIgnoreCase))
+		{
+			var sourcePatchPath = Path.Combine(modDirectory, byPatch.Key);
+			if (!File.Exists(sourcePatchPath)) continue;
+
+			var selections = byPatch
+				.Select(selection => new PatchSubsetSelection(
+					sourcePatchPath,
+					new AdaptationAssetKey(selection.Key.TypeId, selection.Key.FileId)))
+				.ToArray();
+			if (selections.Length == 0) continue;
+
+			var partDir = Path.Combine(stagingRoot, $"unit-part-{partIndex++}");
+			Directory.CreateDirectory(partDir);
+			var result = await writer
+				.WriteSelectedAsync(sourcePatchPath, partDir, selections, overwriteExisting: true, cancellationToken)
+				.ConfigureAwait(false);
+			var produced = result?.TocFilePath;
+			if (string.IsNullOrWhiteSpace(produced) || !File.Exists(produced)) continue;
+
+			var targetPath = Path.Combine(unitStageDirectory, Path.GetFileName(byPatch.Key));
+			MoveAs(produced, targetPath);
+			written.Add(targetPath);
+		}
+
+		return written;
+	}
+
+	internal static async ValueTask UpgradeOutdatedStagedUnitPatchesAsync(
+		IReadOnlyList<string> stagedUnitPatchPaths,
+		string stagingRoot,
+		string gameDataFolder,
+		IModSameKeyReconstructionService reconstruction,
+		List<string> notes,
+		Action<string>? onStage = null,
+		CancellationToken cancellationToken = default)
+	{
+		ArgumentNullException.ThrowIfNull(stagedUnitPatchPaths);
+		ArgumentException.ThrowIfNullOrWhiteSpace(stagingRoot);
+		ArgumentException.ThrowIfNullOrWhiteSpace(gameDataFolder);
+		ArgumentNullException.ThrowIfNull(reconstruction);
+		ArgumentNullException.ThrowIfNull(notes);
+
+		var scanner = new HD2ModAdaptation.PatchReconstruction.PatchTocScanner();
+		var probe = new UnitVersionProbe();
+		for (var index = 0; index < stagedUnitPatchPaths.Count; index++)
+		{
+			cancellationToken.ThrowIfCancellationRequested();
+			var stagedPatchPath = stagedUnitPatchPaths[index];
+			if (!File.Exists(stagedPatchPath)) continue;
+
+			var entries = await scanner.ScanEntriesAsync(stagedPatchPath, cancellationToken).ConfigureAwait(false);
+			var analysis = new PatchGroupAnalysis(
+				new PatchGroupInput(stagedPatchPath),
+				[],
+				[],
+				[],
+				DateTimeOffset.UtcNow,
+				"sectional-source-upgrade",
+				PatchAnalysisDepth.Inventory,
+				entries);
+			var report = ModUnitCompatibilityReport.FromEvidence(
+				await probe.ProbeAsync(analysis, cancellationToken).ConfigureAwait(false));
+			if (!report.IsOutdated)
+				continue;
+
+			var fileName = Path.GetFileName(stagedPatchPath);
+			onStage?.Invoke($"正在将过时来源 Unit 升级至当前游戏版本（{fileName}）…");
+			var stageDirectory = Path.GetDirectoryName(stagedPatchPath)
+				?? throw new InvalidDataException($"无法解析暂存目录：{stagedPatchPath}");
+			var relativePath = Path.GetRelativePath(stagingRoot, stageDirectory);
+			var stageNode = new ModNode(
+				ModNodeId.New(),
+				relativePath,
+				new ModNodeMetadata(fileName, null, DateTimeOffset.UtcNow, null),
+				Array.Empty<PatchGroupKey>(),
+				Array.Empty<ModNodeId>());
+			var upgradeDirectory = Path.Combine(stagingRoot, $"unit-upgraded-{index}");
+			var upgraded = await reconstruction.GenerateCandidateAsync(
+				stageNode,
+				stagingRoot,
+				gameDataFolder,
+				upgradeDirectory,
+				cancellationToken,
+				sourcePatchTocPath: stagedPatchPath).ConfigureAwait(false);
+			var upgradedPatchPath = Path.Combine(upgradeDirectory, fileName);
+			if (!upgraded.IsSuccessful || !File.Exists(upgradedPatchPath))
+			{
+				var detail = upgraded.Issues.Count == 0
+					? "不满足同 ID 升级条件"
+					: string.Join("；", upgraded.Issues.Take(3).Select(issue => issue.Message));
+				notes.Add($"来源 {fileName} 未能升级至当前游戏版本（{detail}），保留原版来源继续转换。");
+				continue;
+			}
+
+			MoveAs(upgradedPatchPath, stagedPatchPath);
 		}
 	}
 

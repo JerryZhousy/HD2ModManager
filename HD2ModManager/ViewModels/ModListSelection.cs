@@ -40,7 +40,14 @@ public sealed record ModListRowPresentation(
     string? Summary = null,
     string? OrderLabel = null,
     ModListRowTone OrderTone = ModListRowTone.Accent,
-    string? Note = null)
+    string? Note = null,
+    // 行在关系里的位置：OccupancyLabel = 它是视觉来源（"视觉来源 · 3 个目标"），
+    // MappingLabel = 它被映射到了谁（"已映射到：X"）。两者都靠右，
+    // 左边那几格回答"这一行是什么"，右边回答"它挂在谁身上"。
+    string? OccupancyLabel = null,
+    ModListRowTone OccupancyTone = ModListRowTone.Accent,
+    string? MappingLabel = null,
+    ModListRowTone MappingTone = ModListRowTone.Accent)
 {
     public static ModListRowPresentation Empty { get; } = new();
 
@@ -50,6 +57,8 @@ public sealed record ModListRowPresentation(
     public bool HasSummary => !string.IsNullOrWhiteSpace(Summary);
     public bool HasOrder => !string.IsNullOrWhiteSpace(OrderLabel);
     public bool HasNote => !string.IsNullOrWhiteSpace(Note);
+    public bool HasOccupancy => !string.IsNullOrWhiteSpace(OccupancyLabel);
+    public bool HasMapping => !string.IsNullOrWhiteSpace(MappingLabel);
 }
 
 public interface IModListSelectable : IModListKeyed

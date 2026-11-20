@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media.Animation;
+using HD2ModCore.Infrastructure.Sectional;
 using HD2ModManager.Controls.Lists;
 using HD2ModManager.ViewModels;
 
@@ -76,17 +77,24 @@ public partial class ArmorRegistryPageView : UserControl, IModRelationshipDropTa
 			viewModel.ApplyAvailableSelection(e.SelectedKeys);
 	}
 
+	private void OnAvailableRowClicked(object? sender, ModListRowEventArgs e)
+	{
+		if (DataContext is not ArmorRegistryPageViewModel viewModel) return;
+
+		// 左侧停在某个来源上时，右侧是"这个来源的目标列表"：此刻点一枚已映射的行是在
+		// **选中它**（意思是从别的来源挪过来），不能再顺手把左边的来源换掉。
+		if (viewModel.IsProviderDetailOpen) return;
+
+		// 平时（左侧是来源列表）：点已被映射的行就是"这个护甲映射到谁"——跳到左侧对应来源。
+		if (e.Item is RuntimeArmorChoiceViewModel { MappedProviderKey: not null } item)
+			viewModel.NavigateToMappedProvider(item);
+	}
+
 	private void OnAvailableRowActionInvoked(object? sender, ModListRowActionEventArgs e)
 	{
 		if (e.Action == ModListRowAction.ArmorAssign
 			&& DataContext is ArmorRegistryPageViewModel viewModel)
 			viewModel.AssignAvailableItem(e.Item as RuntimeArmorChoiceViewModel);
-	}
-
-	private void OnCycleAvailableArmorUnitFilterClick(object sender, RoutedEventArgs e)
-	{
-		if (DataContext is ArmorRegistryPageViewModel viewModel)
-			viewModel.CycleAvailableArmorUnitFilter();
 	}
 
 	private void OnBackToProvidersClick(object? sender, EventArgs e)
