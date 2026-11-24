@@ -1,0 +1,446 @@
+name: Sync Upstream & Notify
+
+on:
+  schedule:
+    # Daily at 01:00 UTC (09:00 Asia/Shanghai)
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      test_email:
+        description: Send a test notification email even when upstream has no new commits
+        required: false
+        default: false
+        type: boolean
+      force_notify:
+        description: Send notification again even if this upstream SHA was already reported
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/AssestinaR/HD2ModManager.git
+  UPSTREAM_SLUG: AssestinaR/HD2ModManager
+  TARGET_BRANCH: master
+  CONFLICT_BRANCH: sync/upstream-conflict
+  DEFAULT_MAIL_TO: jerryzhousy@gmail.com
+  LOCAL_REPO_HINT: D:\Projects\HD2ModManager
+  LOCAL_DEPLOY_HINT: D:\Modding\HD2ModManager
+  DOWNSTREAM_WORKFLOW_HINT: build (build.yml)
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream commits
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          HAS_SYNC_PAT: ${{ secrets.SYNC_PAT != '' }}
+          TEST_EMAIL: ${{ github.event_name == 'workflow_dispatch' && inputs.test_email || 'false' }}
+          FORCE_NOTIFY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_notify || 'false' }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch upstream "$TARGET_BRANCH" --no-tags
+
+          FORK_HEAD_BEFORE=$(git rev-parse HEAD)
+          FORK_SHORT_BEFORE=$(git rev-parse --short HEAD)
+          UPSTREAM_HEAD=$(git rev-parse "upstream/$TARGET_BRANCH")
+          UPSTREAM_SHORT=$(git rev-parse --short "upstream/$TARGET_BRANCH")
+          MERGE_BASE=$(git merge-base HEAD "upstream/$TARGET_BRANCH")
+
+          STATUS="up_to_date"
+          SHOULD_NOTIFY="false"
+          NEW_HEAD="$FORK_HEAD_BEFORE"
+          NEW_SHORT="$FORK_SHORT_BEFORE"
+          COMMIT_COUNT="0"
+          WORKFLOW_TOUCHED="false"
+          PR_URL=""
+          PRIOR_REPORTED="false"
+          ERROR_DETAIL=""
+          COMMITS_FILE="$RUNNER_TEMP/commits.txt"
+          DIFFSTAT_FILE="$RUNNER_TEMP/diffstat.txt"
+          CONFLICTS_FILE="$RUNNER_TEMP/conflicts.txt"
+
+          : > "$COMMITS_FILE"
+          : > "$DIFFSTAT_FILE"
+          : > "$CONFLICTS_FILE"
+
+          if git merge-base --is-ancestor "$UPSTREAM_HEAD" HEAD; then
+            echo "Already up-to-date with $UPSTREAM_SLUG:$TARGET_BRANCH ($UPSTREAM_SHORT)."
+            if [ "$TEST_EMAIL" = "true" ]; then
+              STATUS="test_email"
+              SHOULD_NOTIFY="true"
+            fi
+          else
+            COMMIT_COUNT=$(git rev-list --count HEAD.."upstream/$TARGET_BRANCH")
+            git log --no-merges -n 40 --pretty=format:"* %h - %s (%an, %cd)" --date=short HEAD.."upstream/$TARGET_BRANCH" > "$COMMITS_FILE" || true
+            git diff --stat "$MERGE_BASE".."upstream/$TARGET_BRANCH" | tail -n 30 > "$DIFFSTAT_FILE" || true
+
+            if git diff --name-only "$MERGE_BASE".."upstream/$TARGET_BRANCH" | grep -q '^\.github/workflows/'; then
+              WORKFLOW_TOUCHED="true"
+            fi
+
+            MERGE_OK="true"
+            if git merge-base --is-ancestor HEAD "upstream/$TARGET_BRANCH"; then
+              git merge --ff-only "upstream/$TARGET_BRANCH" || MERGE_OK="false"
+            else
+              git merge --no-edit -m "merge: sync upstream/$TARGET_BRANCH ($UPSTREAM_SHORT)" "upstream/$TARGET_BRANCH" || MERGE_OK="false"
+            fi
+
+            if [ "$MERGE_OK" = "true" ]; then
+              PUSH_ERR_LOG="$RUNNER_TEMP/push_err.log"
+              if git push origin "$TARGET_BRANCH" 2> "$PUSH_ERR_LOG"; then
+                STATUS="synced"
+                SHOULD_NOTIFY="true"
+                NEW_HEAD=$(git rev-parse HEAD)
+                NEW_SHORT=$(git rev-parse --short HEAD)
+                echo "Synced $COMMIT_COUNT upstream commit(s) to $TARGET_BRANCH ($NEW_SHORT)."
+              else
+                ERROR_DETAIL=$(cat "$PUSH_ERR_LOG" || true)
+                echo "Push to $TARGET_BRANCH failed: $ERROR_DETAIL"
+                git reset --hard "$FORK_HEAD_BEFORE"
+                STATUS="push_blocked"
+                SHOULD_NOTIFY="true"
+              fi
+            else
+              git diff --name-only --diff-filter=U > "$CONFLICTS_FILE" || true
+              git merge --abort || true
+              STATUS="conflict"
+              SHOULD_NOTIFY="true"
+
+              EXISTING_SHA_ISSUE=$(gh issue list --state open --search "upstream-sha:$UPSTREAM_HEAD in:body" --json number -q '.[0].number' || true)
+              PRIOR_PR_INFO=$(gh pr list --head "$CONFLICT_BRANCH" --base "$TARGET_BRANCH" --state open --json url,body -q '.[0] // empty' || true)
+              EXISTING_PR_URL=$(python3 -c 'import json,sys; s=sys.argv[1]; print(json.loads(s).get("url","") if s else "")' "$PRIOR_PR_INFO")
+              PRIOR_PR_BODY=$(python3 -c 'import json,sys; s=sys.argv[1]; print(json.loads(s).get("body","") if s else "")' "$PRIOR_PR_INFO")
+              if [ -n "$EXISTING_SHA_ISSUE" ] || echo "$PRIOR_PR_BODY" | grep -qF "upstream-sha:$UPSTREAM_HEAD"; then
+                PRIOR_REPORTED="true"
+              fi
+
+              if [ "$WORKFLOW_TOUCHED" = "true" ] && [ "$HAS_SYNC_PAT" != "true" ]; then
+                echo "Upstream modified .github/workflows/ without SYNC_PAT; skipping conflict branch push."
+                ERROR_DETAIL="Upstream modified .github/workflows/, which GITHUB_TOKEN cannot push without SYNC_PAT."
+              else
+                if git push origin "upstream/$TARGET_BRANCH:refs/heads/$CONFLICT_BRANCH" --force; then
+                  PR_BODY=$(cat <<EOF
+          <!-- upstream-sha:$UPSTREAM_HEAD -->
+          Upstream \`$UPSTREAM_SLUG:$TARGET_BRANCH\` has **$COMMIT_COUNT** new commit(s) that conflict with \`$TARGET_BRANCH\`.
+
+          ### Conflicting Files
+          \`\`\`
+          $(cat "$CONFLICTS_FILE")
+          \`\`\`
+
+          ### Local Resolution
+          \`\`\`bash
+          git fetch upstream $TARGET_BRANCH
+          git checkout $TARGET_BRANCH
+          git merge upstream/$TARGET_BRANCH
+          \`\`\`
+          EOF
+                  )
+                  if [ -n "$EXISTING_PR_URL" ]; then
+                    gh pr edit "$EXISTING_PR_URL" --body "$PR_BODY" || true
+                    PR_URL="$EXISTING_PR_URL"
+                  else
+                    PR_URL=$(gh pr create \
+                      --base "$TARGET_BRANCH" \
+                      --head "$CONFLICT_BRANCH" \
+                      --title "conflict: manual merge needed for upstream/$TARGET_BRANCH ($UPSTREAM_SHORT)" \
+                      --body "$PR_BODY" || true)
+                  fi
+                fi
+              fi
+            fi
+
+            if [ "$SHOULD_NOTIFY" = "true" ] && [ "$STATUS" != "synced" ] && [ "$FORCE_NOTIFY" != "true" ]; then
+              if [ "$PRIOR_REPORTED" != "true" ]; then
+                EXISTING_SHA_ISSUE=$(gh issue list --state open --search "upstream-sha:$UPSTREAM_HEAD in:body" --json number -q '.[0].number' || true)
+                if [ -n "$EXISTING_SHA_ISSUE" ]; then
+                  PRIOR_REPORTED="true"
+                fi
+              fi
+              if [ "$PRIOR_REPORTED" = "true" ]; then
+                echo "Upstream SHA $UPSTREAM_HEAD was already reported previously; skipping duplicate notification."
+                SHOULD_NOTIFY="false"
+              fi
+            fi
+          fi
+
+          python3 - <<'PY' \
+            "$RUNNER_TEMP/sync_context.json" \
+            "$STATUS" \
+            "$SHOULD_NOTIFY" \
+            "$FORK_HEAD_BEFORE" \
+            "$FORK_SHORT_BEFORE" \
+            "$NEW_HEAD" \
+            "$NEW_SHORT" \
+            "$UPSTREAM_HEAD" \
+            "$UPSTREAM_SHORT" \
+            "$COMMIT_COUNT" \
+            "$WORKFLOW_TOUCHED" \
+            "$PR_URL" \
+            "$ERROR_DETAIL" \
+            "$COMMITS_FILE" \
+            "$DIFFSTAT_FILE" \
+            "$CONFLICTS_FILE"
+          import json
+          import pathlib
+          import sys
+
+          (
+              out_path,
+              status,
+              should_notify,
+              fork_before,
+              fork_short_before,
+              new_head,
+              new_short,
+              upstream_head,
+              upstream_short,
+              commit_count,
+              workflow_touched,
+              pr_url,
+              error_detail,
+              commits_file,
+              diffstat_file,
+              conflicts_file,
+          ) = sys.argv[1:]
+
+          data = {
+              "status": status,
+              "should_notify": should_notify == "true",
+              "fork_before": fork_before,
+              "fork_short_before": fork_short_before,
+              "new_head": new_head,
+              "new_short": new_short,
+              "upstream_head": upstream_head,
+              "upstream_short": upstream_short,
+              "commit_count": int(commit_count),
+              "workflow_touched": workflow_touched == "true",
+              "pr_url": pr_url,
+              "error_detail": error_detail.strip(),
+              "commits": pathlib.Path(commits_file).read_text(encoding="utf-8").strip(),
+              "diffstat": pathlib.Path(diffstat_file).read_text(encoding="utf-8").strip(),
+              "conflicts": pathlib.Path(conflicts_file).read_text(encoding="utf-8").strip(),
+          }
+          pathlib.Path(out_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+          PY
+
+      - name: Send email notification (with Issue fallback)
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          HAS_SYNC_PAT: ${{ secrets.SYNC_PAT != '' }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_SERVER: ${{ secrets.MAIL_SERVER || vars.MAIL_SERVER }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT || vars.MAIL_PORT }}
+          MAIL_TO: ${{ secrets.MAIL_TO || vars.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM || vars.MAIL_FROM }}
+          REPO_FULL: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import html
+          import json
+          import os
+          import pathlib
+          import smtplib
+          import subprocess
+          from email.message import EmailMessage
+
+          ctx = json.loads((pathlib.Path(os.environ["RUNNER_TEMP"]) / "sync_context.json").read_text(encoding="utf-8"))
+          status = ctx["status"]
+          should_notify = ctx["should_notify"]
+          repo_full = os.environ["REPO_FULL"]
+          upstream_slug = os.environ["UPSTREAM_SLUG"]
+          target_branch = os.environ["TARGET_BRANCH"]
+          has_sync_pat = os.environ.get("HAS_SYNC_PAT", "false") == "true"
+          local_hint = os.environ["LOCAL_REPO_HINT"]
+          deploy_hint = os.environ["LOCAL_DEPLOY_HINT"]
+          downstream_hint = os.environ["DOWNSTREAM_WORKFLOW_HINT"]
+          run_url = os.environ["RUN_URL"]
+          summary_path = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+
+          def append_summary(text: str) -> None:
+              with summary_path.open("a", encoding="utf-8") as fh:
+                  fh.write(text + "\n")
+
+          if not should_notify:
+              append_summary(f"### Upstream Sync: `{status}`\n\nNo new notification needed (`{ctx['upstream_short']}`).")
+              raise SystemExit(0)
+
+          if status == "synced":
+              subject = f"[HD2ModManager] 已同步上游 {ctx['commit_count']} 个 commit，请更新本地部署版本"
+              headline = f"已自动合并上游 {upstream_slug}:{target_branch} 的 {ctx['commit_count']} 个新提交并推送到 {repo_full}:{target_branch} ({ctx['new_short']})。"
+              if has_sync_pat:
+                  ci_note = f"已配置 SYNC_PAT：下游 {downstream_hint} 将自动运行编译与测试。"
+              else:
+                  ci_note = f"未配置 SYNC_PAT：GITHUB_TOKEN 推送不会自动触发 {downstream_hint}，如需自动验证/构建请配置 SYNC_PAT。"
+              action_block = (
+                  f"建议本地操作：\n"
+                  f"1. 进入 {local_hint} 拉取最新 {target_branch}：\n"
+                  f"   git fetch origin && git pull\n"
+                  f"2. 重新构建/发布并更新本地部署目录（{deploy_hint}）。"
+              )
+          elif status == "conflict":
+              subject = f"[HD2ModManager] 上游同步存在冲突（{ctx['commit_count']} 个 commit），需手动合并"
+              headline = f"检测到上游 {upstream_slug}:{target_branch} 有 {ctx['commit_count']} 个新提交（{ctx['upstream_short']}），但自动合并发生冲突，已中止推送以保护 {target_branch}。"
+              ci_note = f"同步冲突分支/PR：{ctx['pr_url'] or '未能自动创建（详见工作流日志）'}"
+              action_block = (
+                  f"冲突文件：\n{ctx['conflicts'] or '(未列出)'}\n\n"
+                  f"建议本地解决：\n"
+                  f"1. 进入 {local_hint}\n"
+                  f"2. git fetch upstream && git merge upstream/{target_branch}\n"
+                  f"3. 解决冲突、测试通过后推送并更新本地部署目录（{deploy_hint}）。"
+              )
+          elif status == "push_blocked":
+              subject = f"[HD2ModManager] 上游合并成功但推送被拒绝（{ctx['upstream_short']}）"
+              headline = f"上游 {upstream_slug}:{target_branch} 有 {ctx['commit_count']} 个新提交，本地合并无冲突，但推送到 {repo_full}:{target_branch} 被拒绝。"
+              ci_note = f"失败原因：{ctx['error_detail'] or '未知推送限制（若上游修改了 .github/workflows/，请配置带 workflow 权限的 SYNC_PAT）'}"
+              action_block = (
+                  f"建议本地同步：\n"
+                  f"1. 进入 {local_hint}\n"
+                  f"2. git fetch upstream && git merge upstream/{target_branch} && git push origin {target_branch}\n"
+                  f"3. 更新本地部署目录（{deploy_hint}）。"
+              )
+          else:
+              subject = "[HD2ModManager] 上游同步通知测试邮件"
+              headline = f"这是一封手动触发的测试邮件。当前 {repo_full}:{target_branch} 已与上游 {upstream_slug}:{target_branch} ({ctx['upstream_short']}) 保持同步。"
+              ci_note = f"SYNC_PAT 状态：{'已配置' if has_sync_pat else '未配置（仅使用 GITHUB_TOKEN）'}"
+              action_block = f"本地源码目录：{local_hint}\n本地部署目录：{deploy_hint}"
+
+          commits_text = ctx["commits"] or "(无新增上游 commit)"
+          diffstat_text = ctx["diffstat"] or "(无文件变更统计)"
+
+          plain_body = (
+              f"{headline}\n\n"
+              f"{ci_note}\n\n"
+              f"=== 上游提交记录 ===\n{commits_text}\n\n"
+              f"=== 变更统计 ===\n{diffstat_text}\n\n"
+              f"=== 下一步 ===\n{action_block}\n\n"
+              f"工作流运行日志：{run_url}\n"
+          )
+
+          html_body = f"""\
+          <html>
+            <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.6; color: #222;">
+              <h3>{html.escape(subject)}</h3>
+              <p>{html.escape(headline)}</p>
+              <p><strong>构建联动说明：</strong>{html.escape(ci_note)}</p>
+              <h4>上游提交记录</h4>
+              <pre style="background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto;">{html.escape(commits_text)}</pre>
+              <h4>变更文件统计</h4>
+              <pre style="background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto;">{html.escape(diffstat_text)}</pre>
+              <h4>本地部署更新提醒</h4>
+              <pre style="background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto;">{html.escape(action_block)}</pre>
+              <p><a href="{html.escape(run_url)}">查看本次 GitHub Actions 运行详情</a></p>
+            </body>
+          </html>
+          """
+
+          mail_user = os.environ.get("MAIL_USERNAME", "").strip()
+          mail_pass = os.environ.get("MAIL_PASSWORD", "").strip()
+          mail_to = os.environ.get("MAIL_TO", "").strip() or mail_user or os.environ["DEFAULT_MAIL_TO"]
+          mail_from = os.environ.get("MAIL_FROM", "").strip() or mail_user
+          mail_server = os.environ.get("MAIL_SERVER", "").strip()
+          mail_port_raw = os.environ.get("MAIL_PORT", "").strip()
+
+          def infer_smtp(username: str) -> tuple[str, int]:
+              domain = username.split("@")[-1].lower() if "@" in username else ""
+              mapping = {
+                  "gmail.com": ("smtp.gmail.com", 465),
+                  "qq.com": ("smtp.qq.com", 465),
+                  "foxmail.com": ("smtp.qq.com", 465),
+                  "163.com": ("smtp.163.com", 465),
+                  "126.com": ("smtp.126.com", 465),
+                  "outlook.com": ("smtp.office365.com", 587),
+                  "hotmail.com": ("smtp.office365.com", 587),
+                  "live.com": ("smtp.office365.com", 587),
+              }
+              return mapping.get(domain, ("smtp.gmail.com", 465))
+
+          email_sent = False
+          email_err = ""
+
+          if mail_user and mail_pass:
+              default_host, default_port = infer_smtp(mail_user)
+              host = mail_server or default_host
+              port = int(mail_port_raw) if mail_port_raw else default_port
+              recipients = [addr.strip() for addr in mail_to.split(",") if addr.strip()]
+
+              msg = EmailMessage()
+              msg["Subject"] = subject
+              msg["From"] = mail_from
+              msg["To"] = ", ".join(recipients)
+              msg.set_content(plain_body)
+              msg.add_alternative(html_body, subtype="html")
+
+              try:
+                  if port == 587:
+                      with smtplib.SMTP(host, port, timeout=30) as smtp:
+                          smtp.ehlo()
+                          smtp.starttls()
+                          smtp.ehlo()
+                          smtp.login(mail_user, mail_pass)
+                          smtp.send_message(msg)
+                  else:
+                      with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
+                          smtp.login(mail_user, mail_pass)
+                          smtp.send_message(msg)
+                  email_sent = True
+                  print(f"SMTP email sent to {recipients} via {host}:{port}.")
+              except Exception as exc:
+                  email_err = str(exc)
+                  print(f"SMTP send failed: {email_err}")
+          else:
+              email_err = "MAIL_USERNAME or MAIL_PASSWORD secret is not configured."
+              print(email_err)
+
+          if not email_sent:
+              issue_title = f"[Upstream Sync] {repo_full} 同步状态通知"
+              marker = f"<!-- upstream-sha:{ctx['upstream_head']} -->"
+              issue_body = (
+                  f"{marker}\n"
+                  f"**{subject}**\n\n"
+                  f"> 提示：当前未配置或未能通过 SMTP 直发邮件（原因：`{email_err}`），已自动降级为 Issue 提醒。\n"
+                  f"> 如需启用直发邮件，请在仓库 Secrets 中配置 `MAIL_USERNAME` 与 `MAIL_PASSWORD`（可选 `MAIL_SERVER`、`MAIL_PORT`、`MAIL_TO`）。\n\n"
+                  f"{plain_body}"
+              )
+              existing_issue = subprocess.run(
+                  ["gh", "issue", "list", "--state", "open", "--search", f'"{issue_title}" in:title', "--json", "number", "-q", ".[0].number"],
+                  capture_output=True,
+                  text=True,
+              ).stdout.strip()
+              if existing_issue:
+                  subprocess.run(["gh", "issue", "comment", existing_issue, "--body", issue_body], check=False)
+              else:
+                  subprocess.run(["gh", "issue", "create", "--title", issue_title, "--body", issue_body], check=False)
+
+          append_summary(
+              f"### Upstream Sync Result: `{status}`\n\n"
+              f"- **Upstream**: `{upstream_slug}:{target_branch}` (`{ctx['upstream_short']}`)\n"
+              f"- **New commits**: `{ctx['commit_count']}`\n"
+              f"- **Email delivery**: `{'sent' if email_sent else 'fallback-to-issue (' + email_err + ')'}`\n"
+          )
+          PY
