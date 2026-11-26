@@ -206,7 +206,7 @@ internal static class CliDeploymentPlanArtifacts
 			.InspectAsync(
 				targetValidation.GameDataDirectory,
 				cancellationToken,
-				fastMode ? null : (path, token) => hashCache.GetOrComputeAsync(path, token))
+				(path, token) => hashCache.GetOrComputeAsync(path, token))
 			.ConfigureAwait(false);
 		AddCoreIssues(diagnostics, ownershipInspection.Issues, "ownership");
 		var ownership = new CliDeploymentOwnership(
@@ -273,10 +273,8 @@ internal static class CliDeploymentPlanArtifacts
 			hashCache,
 			fastMode,
 			cancellationToken).ConfigureAwait(false);
-		if (!fastMode)
-		{
-			await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
-		}
+		// SaveAsync 内部有 _dirty 守卫；fastMode 下若所有权校验触发了缓存未命中并补算哈希，这里一并落盘。
+		await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
 		var externalFiles = luaPlan.ExternalFiles
 			.OrderBy(mapping => mapping.TargetPath, StringComparer.OrdinalIgnoreCase)
 			.Select(mapping => new CliDeploymentExternalFile(
@@ -542,10 +540,8 @@ internal static class CliDeploymentPlanArtifacts
 		var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 		var hashCache = CliPatchHashCache.Load(current.Document.Target.ManagerRoot);
 		var patches = await CreatePatchProjectionsAsync(plan, generatedFiles, hashes, hashCache, diagnostics, fastMode, cancellationToken).ConfigureAwait(false);
-		if (!fastMode)
-		{
-			await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
-		}
+		// SaveAsync 内部有 _dirty 守卫；fastMode 下若所有权校验触发了缓存未命中并补算哈希，这里一并落盘。
+		await hashCache.SaveAsync(cancellationToken).ConfigureAwait(false);
 		var externalFiles = preparation.ExternalFiles
 			.OrderBy(mapping => mapping.TargetPath, StringComparer.OrdinalIgnoreCase)
 			.Select(mapping => new CliDeploymentExternalFile(

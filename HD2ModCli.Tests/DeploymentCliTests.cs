@@ -415,6 +415,84 @@ public sealed class DeploymentCliTests
 		Assert.Same(initialBuild, validation.Current);
 	}
 
+	[Fact]
+	public async Task DeployBuild_FastMode_UsesAndPersistsHashCacheForOwnershipInspection()
+	{
+		await using var fixture = await DeploymentFixture.CreateAsync(includeLuaPatch: true);
+		var applyExit = await CliApplication.RunAsync(
+		[
+			"deploy", "apply", "active",
+			"--manager-root", fixture.ManagerRoot,
+			"--game-data", fixture.GameDataDirectory,
+			"--fast",
+			"--confirm",
+			"--json",
+		]);
+		Assert.Equal(0, applyExit);
+
+		// 模拟旧版或 --full/Copy 部署留下的带真实 ContentSha256 的 activation-state.json
+		var stateStore = new JsonActivationStateStore();
+		var state = await stateStore.TryLoadAsync(fixture.GameDataDirectory);
+		Assert.NotNull(state);
+		var filesWithHashes = new List<ActivationStateFileEntry>(state!.Files.Count);
+		foreach (var entry in state.Files)
+		{
+			var bytes = await File.ReadAllBytesAsync(entry.SourcePath);
+			var sha = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant();
+			filesWithHashes.Add(entry with { ContentSha256 = sha });
+		}
+		await stateStore.SaveAsync(fixture.GameDataDirectory, state with { Files = filesWithHashes });
+
+		var cachePath = Path.Combine(fixture.ManagerRoot, "data", "indexes", "patch-hashes.json");
+		if (File.Exists(cachePath)) File.Delete(cachePath);
+
+		var workspace = CliWorkspace.Open(new CliGlobalOptions(
+			ManagerRoot: fixture.ManagerRoot,
+			Library: null,
+			GameData: fixture.GameDataDirectory,
+			RegistryRoot: null,
+			Output: null,
+			Plan: null,
+			Host: null,
+			AddToProfile: null,
+			Keys: null,
+			AddKeys: null,
+			RemoveKeys: null,
+			ArchiveId: null,
+			Kind: null,
+			Header: null,
+			Picks: [],
+			Position: null,
+			Limit: null,
+			Cursor: null,
+			SetActive: false,
+			WithUnsharedOptions: false,
+			WithEffective: false,
+			OnlyCompetition: false,
+			Overwrite: false,
+			Confirm: false,
+			Json: false));
+
+		var firstBuild = await CliDeploymentPlanArtifacts.BuildAsync(workspace, "active", fastMode: true);
+		Assert.NotNull(firstBuild.OwnershipInspection);
+		Assert.True(firstBuild.OwnershipInspection!.IsManaged);
+		Assert.True(File.Exists(cachePath));
+
+		// 修改一个硬链接源文件但保持长度和 LastWriteTimeUtc 不变：
+		// 只有真正命中了 CliPatchHashCache 才不会在所有权校验阶段重读磁盘并报 ManagedPatchHashMismatch。
+		var targetEntry = filesWithHashes.First(entry => entry.Method == DeploymentMethod.HardLink);
+		var originalBytes = await File.ReadAllBytesAsync(targetEntry.SourcePath);
+		var lastWrite = File.GetLastWriteTimeUtc(targetEntry.SourcePath);
+		originalBytes[0] ^= 0xFF;
+		await File.WriteAllBytesAsync(targetEntry.SourcePath, originalBytes);
+		File.SetLastWriteTimeUtc(targetEntry.SourcePath, lastWrite);
+
+		var secondBuild = await CliDeploymentPlanArtifacts.BuildAsync(workspace, "active", fastMode: true);
+		Assert.NotNull(secondBuild.OwnershipInspection);
+		Assert.True(secondBuild.OwnershipInspection!.IsManaged);
+		Assert.DoesNotContain(secondBuild.OwnershipInspection.Issues, issue => issue.Code == "ManagedPatchHashMismatch");
+	}
+
 	private sealed class DeploymentFixture : IAsyncDisposable
 	{
 		private DeploymentFixture(string rootDirectory, string managerRoot, string libraryRoot, string gameDataDirectory, ModNodeId? externalNodeId)

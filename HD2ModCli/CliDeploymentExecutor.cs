@@ -95,10 +95,7 @@ internal static class CliDeploymentExecutor
 			var applyResult = await CoreServices.CreateApplyExecutor()
 				.ExecuteAsync(executionPlan, CancellationToken.None, (path, token) => hashCache.GetOrComputeAsync(path, token))
 				.ConfigureAwait(false);
-			if (!fastMode)
-			{
-				await hashCache.SaveAsync(CancellationToken.None).ConfigureAwait(false);
-			}
+			await hashCache.SaveAsync(CancellationToken.None).ConfigureAwait(false);
 			var applyDiagnostics = ToDiagnostics(applyResult.Issues, "apply");
 			if (applyResult.Success)
 			{
@@ -223,10 +220,7 @@ internal static class CliDeploymentExecutor
 			var applyResult = await CoreServices.CreateApplyExecutor()
 				.ExecuteAsync(executionPlan, CancellationToken.None, (path, token) => hashCache.GetOrComputeAsync(path, token))
 				.ConfigureAwait(false);
-			if (!fastMode)
-			{
-				await hashCache.SaveAsync(CancellationToken.None).ConfigureAwait(false);
-			}
+			await hashCache.SaveAsync(CancellationToken.None).ConfigureAwait(false);
 			var applyDiagnostics = ToDiagnostics(applyResult.Issues, "apply");
 			if (applyResult.Success)
 			{
