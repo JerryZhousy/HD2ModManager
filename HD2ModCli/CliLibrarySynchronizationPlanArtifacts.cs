@@ -97,6 +97,7 @@ internal static class CliLibrarySynchronizationPlanArtifacts
 	public static async ValueTask<CliLibrarySynchronizationBuildResult> BuildAsync(
 		CliWorkspace workspace,
 		IReadOnlyDictionary<string, ModNodeId>? plannedAddedNodeIdsByRelativePath = null,
+		bool fastMode = true,
 		CancellationToken cancellationToken = default)
 	{
 		ArgumentNullException.ThrowIfNull(workspace);
@@ -113,7 +114,7 @@ internal static class CliLibrarySynchronizationPlanArtifacts
 		{
 			var manager = CoreServices.CreateModLibraryManager(paths);
 			var ignoredBefore = await manager.GetPendingStoredDeletionSynchronizationExclusionsAsync(cancellationToken).ConfigureAwait(false);
-			var before = await ComputeInputSnapshotAsync(paths, ignoredBefore, cancellationToken).ConfigureAwait(false);
+			var before = await ComputeInputSnapshotAsync(paths, ignoredBefore, fastMode, cancellationToken).ConfigureAwait(false);
 			var synchronizer = CoreServices.CreateModLibrarySynchronizer();
 			var inspection = await synchronizer
 				.InspectAsync(snapshot, paths.ModsDirectory, ignoredBefore, cancellationToken)
@@ -121,7 +122,7 @@ internal static class CliLibrarySynchronizationPlanArtifacts
 			var plannedIds = ResolvePlannedAddedNodeIds(snapshot, inspection, plannedAddedNodeIdsByRelativePath);
 			var synchronization = synchronizer.ApplyInspection(snapshot, inspection, plannedIds);
 			var ignoredAfter = await manager.GetPendingStoredDeletionSynchronizationExclusionsAsync(cancellationToken).ConfigureAwait(false);
-			var after = await ComputeInputSnapshotAsync(paths, ignoredAfter, cancellationToken).ConfigureAwait(false);
+			var after = await ComputeInputSnapshotAsync(paths, ignoredAfter, fastMode, cancellationToken).ConfigureAwait(false);
 
 			var diagnostics = new List<CliLibrarySynchronizationDiagnostic>();
 			if (!InputSnapshotsEqual(before, after))
@@ -253,6 +254,7 @@ internal static class CliLibrarySynchronizationPlanArtifacts
 	public static async ValueTask<CliLibrarySynchronizationValidationResult> ValidateAsync(
 		CliLibrarySynchronizationPlanDocument document,
 		CliWorkspace workspace,
+		bool fastMode = true,
 		CancellationToken cancellationToken = default)
 	{
 		ArgumentNullException.ThrowIfNull(document);
@@ -274,7 +276,7 @@ internal static class CliLibrarySynchronizationPlanArtifacts
 		CliLibrarySynchronizationBuildResult? current = null;
 		try
 		{
-			current = await BuildAsync(workspace, ExtractPlannedAddedNodeIds(document), cancellationToken).ConfigureAwait(false);
+			current = await BuildAsync(workspace, ExtractPlannedAddedNodeIds(document), fastMode, cancellationToken).ConfigureAwait(false);
 		}
 		catch (CliUserException exception)
 		{
@@ -359,6 +361,7 @@ internal static class CliLibrarySynchronizationPlanArtifacts
 	private static async ValueTask<CliLibrarySynchronizationInputSnapshot> ComputeInputSnapshotAsync(
 		StoragePaths paths,
 		IReadOnlySet<string> ignoredRelativePaths,
+		bool fastMode,
 		CancellationToken cancellationToken)
 	{
 		var libraryJsonSha256 = await ComputeFileSha256Async(paths.LibraryPath, cancellationToken).ConfigureAwait(false);
@@ -395,8 +398,15 @@ internal static class CliLibrarySynchronizationPlanArtifacts
 				AppendField(hash, "patch-file");
 				AppendField(hash, Path.GetFileName(path));
 				AppendField(hash, info.Length.ToString(System.Globalization.CultureInfo.InvariantCulture));
-				await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 128, FileOptions.SequentialScan);
-				hash.AppendData(await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false));
+				if (fastMode)
+				{
+					AppendField(hash, info.LastWriteTimeUtc.Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture));
+				}
+				else
+				{
+					await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 128, FileOptions.SequentialScan);
+					hash.AppendData(await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false));
+				}
 				patchFileCount++;
 				patchByteCount = checked(patchByteCount + info.Length);
 			}

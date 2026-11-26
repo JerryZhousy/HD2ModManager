@@ -66,6 +66,7 @@ public sealed class CliSkillExporterTests
 
 		Assert.Contains("library sync inspect", content, StringComparison.Ordinal);
 		Assert.Contains("library sync apply", content, StringComparison.Ordinal);
+		Assert.Contains("--fast", content, StringComparison.Ordinal);
 	}
 
 	[Fact]

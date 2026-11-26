@@ -62,6 +62,70 @@ public sealed class LibraryAndOptionManagementCliTests
 	}
 
 	[Fact]
+	public async Task LibrarySync_ApplyDirect_ReconcilesWithoutPlanFileAndPreservesUntouchedState()
+	{
+		await using var fixture = await LibrarySyncFixture.CreateAsync(includeMissingRegisteredDirectory: false);
+
+		Assert.Equal(0, await RunAsync(
+			"library", "sync", "apply",
+			"--manager-root", fixture.ManagerRoot,
+			"--confirm",
+			"--json"));
+
+		var persisted = await new JsonModLibraryStore(new StoragePaths(fixture.ManagerRoot, fixture.LibraryRoot), allowLegacyMigration: false)
+			.TryLoadReadOnlyAsync();
+		Assert.NotNull(persisted);
+		var added = Assert.Single(persisted!.Nodes.Values, node => string.Equals(node.RelativePath, fixture.ExternalRelativePath, StringComparison.OrdinalIgnoreCase));
+		Assert.Equal([new PatchGroupKey("0123456789abcdef", 0)], added.PatchGroups);
+
+		Assert.Equal(fixture.ProfilesBefore, await File.ReadAllBytesAsync(fixture.ProfilesPath));
+		Assert.Equal(fixture.OptionActivationsBefore, await File.ReadAllBytesAsync(fixture.OptionActivationsPath));
+		Assert.Equal(fixture.ExternalPatchBefore, await File.ReadAllBytesAsync(fixture.ExternalPatchPath));
+		Assert.Equal(fixture.ExternalSidecarBefore, await File.ReadAllBytesAsync(fixture.ExternalSidecarPath));
+	}
+
+	[Fact]
+	public async Task LibrarySync_FullMode_ReconcilesWithCryptographicHash()
+	{
+		await using var fixture = await LibrarySyncFixture.CreateAsync(includeMissingRegisteredDirectory: false);
+		var planPath = Path.Combine(fixture.RootDirectory, "library-sync-plan-full.json");
+
+		Assert.Equal(0, await RunAsync(
+			"library", "sync", "inspect",
+			"--manager-root", fixture.ManagerRoot,
+			"--full",
+			"--json"));
+
+		Assert.Equal(0, await RunAsync(
+			"library", "sync", "plan",
+			"--manager-root", fixture.ManagerRoot,
+			"--output", planPath,
+			"--full",
+			"--json"));
+
+		Assert.Equal(0, await RunAsync(
+			"library", "sync", "validate",
+			"--manager-root", fixture.ManagerRoot,
+			"--plan", planPath,
+			"--full",
+			"--json"));
+
+		Assert.Equal(0, await RunAsync(
+			"library", "sync", "apply",
+			"--manager-root", fixture.ManagerRoot,
+			"--plan", planPath,
+			"--full",
+			"--confirm",
+			"--json"));
+
+		var persisted = await new JsonModLibraryStore(new StoragePaths(fixture.ManagerRoot, fixture.LibraryRoot), allowLegacyMigration: false)
+			.TryLoadReadOnlyAsync();
+		Assert.NotNull(persisted);
+		var added = Assert.Single(persisted!.Nodes.Values, node => string.Equals(node.RelativePath, fixture.ExternalRelativePath, StringComparison.OrdinalIgnoreCase));
+		Assert.Equal([new PatchGroupKey("0123456789abcdef", 0)], added.PatchGroups);
+	}
+
+	[Fact]
 	public async Task LibrarySync_MissingRegisteredDirectory_BlocksPlanValidationAndApplyWithoutChangingState()
 	{
 		await using var fixture = await LibrarySyncFixture.CreateAsync(includeMissingRegisteredDirectory: true);

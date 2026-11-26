@@ -323,6 +323,53 @@ public sealed class DeploymentCliTests
 	}
 
 	[Fact]
+	public async Task DeployPlan_DefaultBehavior_EnablesFastModeByDefault()
+	{
+		await using var fixture = await DeploymentFixture.CreateAsync(includeLuaPatch: true);
+		var planPath = Path.Combine(fixture.RootDirectory, "default-fast-plan.json");
+
+		// 不带 --fast 参数，验证默认即为 fast 模式
+		var planExit = await CliApplication.RunAsync(
+		[
+			"deploy", "plan", "active",
+			"--manager-root", fixture.ManagerRoot,
+			"--game-data", fixture.GameDataDirectory,
+			"--output", planPath,
+			"--json",
+		]);
+
+		Assert.Equal(0, planExit);
+		var planJson = await File.ReadAllTextAsync(planPath);
+		var doc = JsonSerializer.Deserialize<CliDeploymentPlanDocument>(planJson, CliOutput.JsonOptions);
+		Assert.NotNull(doc);
+		Assert.All(doc!.Patches.Where(p => !p.IsGenerated), patch => Assert.Null(patch.SourceSha256));
+	}
+
+	[Fact]
+	public async Task DeployPlan_FullOption_PerformsFullPhysicalSha256()
+	{
+		await using var fixture = await DeploymentFixture.CreateAsync(includeLuaPatch: true);
+		var planPath = Path.Combine(fixture.RootDirectory, "full-mode-plan.json");
+
+		// 显式带 --full 参数，要求执行全量物理 SHA-256
+		var planExit = await CliApplication.RunAsync(
+		[
+			"deploy", "plan", "active",
+			"--manager-root", fixture.ManagerRoot,
+			"--game-data", fixture.GameDataDirectory,
+			"--output", planPath,
+			"--full",
+			"--json",
+		]);
+
+		Assert.Equal(0, planExit);
+		var planJson = await File.ReadAllTextAsync(planPath);
+		var doc = JsonSerializer.Deserialize<CliDeploymentPlanDocument>(planJson, CliOutput.JsonOptions);
+		Assert.NotNull(doc);
+		Assert.All(doc!.Patches.Where(p => !p.IsGenerated), patch => Assert.False(string.IsNullOrWhiteSpace(patch.SourceSha256)));
+	}
+
+	[Fact]
 	public async Task DeployValidate_ReusesPreviousSnapshot_WhenNoDriftOccurs()
 	{
 		await using var fixture = await DeploymentFixture.CreateAsync(includeLuaPatch: true);

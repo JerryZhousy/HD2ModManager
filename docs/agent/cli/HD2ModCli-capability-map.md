@@ -115,7 +115,7 @@
 | 族 | 子命令数 | inspect | plan | validate | apply | 备注 |
 |---|---|---|---|---|---|---|
 | `import` | 8 | ✅ `import inspect` | ✅ | ✅ | ✅ | +`batch` 全套 8 条 |
-| `library sync` | 4 | ✅ | ✅ | ✅ | ✅ | 完整四段 |
+| `library sync` | 4 | ✅ | ✅ | ✅ | ✅ | 完整四段；支持 `library sync apply` 直通免计划对账；默认 `--fast` 极速轻量指纹，可选 `--full` 全量 SHA-256 |
 | `decoration package` | 3 | — | ✅ | ✅ | ✅ | 预览靠 `decoration inspect source` |
 | `decoration edit` | 5 | ✅ `export` + `inspect` | ✅ | ✅ | ✅ | **五段**：export→inspect→plan→validate→apply |
 | `mod export` | 3 | — | ✅ | ✅ | ✅ | 无独立 inspect |
@@ -220,7 +220,7 @@ inspect  →  plan  →  validate  →  apply --confirm
 | **不执行 Mod Lua** | 只做编译校验，不在本地 Lua 运行时执行 |
 | **危险参数门禁** | `--allow-unsafe-lua` 是唯一"解锁风险"的开关，且逐命令校验 |
 | **参数白名单式校验** | 121 个 `Ensure*` / `Require*` 函数逐命令拒绝不相关参数（如 `--registry-root` 只准用于 `armor-registry`） |
-| **极速与直通部署** | `deploy plan`/`apply` 支持 `--fast`（跳过物理全量 SHA-256，采用硬链接/符号链接快速校验与轻量指纹，对齐 GUI 秒级性能）；`deploy apply` 支持直通免落盘模式，并在锁内安全复用验证快照 |
+| **极速与直通部署** | `deploy plan`/`apply` 默认启用极速模式（跳过物理全量 SHA-256，采用硬链接/符号链接快速校验与轻量指纹，对齐 GUI 秒级性能；可选 `--full` / `--no-fast` 显式进行全量物理哈希计算）；`deploy apply` 支持直通免落盘模式，并在锁内安全复用验证快照 |
 
 `safety` 等级分布（140 条中）：
 

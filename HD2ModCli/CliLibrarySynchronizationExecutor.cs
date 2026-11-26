@@ -17,13 +17,76 @@ internal sealed record CliLibrarySynchronizationExecutionResult(
 /// </summary>
 internal static class CliLibrarySynchronizationExecutor
 {
+	public static async ValueTask<CliLibrarySynchronizationExecutionResult> ApplyDirectAsync(
+		CliWorkspace workspace,
+		bool fastMode = true,
+		CancellationToken cancellationToken = default)
+	{
+		var build = await CliLibrarySynchronizationPlanArtifacts
+			.BuildAsync(workspace, plannedAddedNodeIdsByRelativePath: null, fastMode: fastMode, cancellationToken)
+			.ConfigureAwait(false);
+		if (!build.Document.IsReady)
+			return Failure(build.Document.Inspection.Diagnostics);
+
+		await using var session = await CliWriteTargetGuard
+			.AcquireSessionAsync(workspace, CliWriteTargetMode.Mutation, cancellationToken)
+			.ConfigureAwait(false);
+
+		var migration = await CoreServices.CreateModContentLayoutMigration()
+			.MigrateAsync(workspace.LibraryRoot!, build.Synchronization.Snapshot, cancellationToken)
+			.ConfigureAwait(false);
+		if (!migration.IsClean)
+		{
+			var diagnostics = migration.Conflicts
+				.Select(name => new CliLibrarySynchronizationDiagnostic(
+					"LibraryLayoutMigrationConflict", "warning", false,
+					$"{name} 的新旧两个基底目录（sectional/ 与 vpk2patch/）同时存在；已跳过改名，需要人工确认哪个才是当前产物。",
+					Path: name))
+				.Concat(migration.Failures.Select(failure => new CliLibrarySynchronizationDiagnostic(
+					"LibraryLayoutMigrationFailed", "warning", false,
+					$"基底目录改名失败：{failure}")))
+				.ToArray();
+			if (diagnostics.Length != 0)
+				return new CliLibrarySynchronizationExecutionResult(
+					true, false, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), diagnostics);
+		}
+
+		var currentBuild = migration.Renamed > 0
+			? await CliLibrarySynchronizationPlanArtifacts.BuildAsync(workspace, plannedAddedNodeIdsByRelativePath: null, fastMode: fastMode, cancellationToken).ConfigureAwait(false)
+			: build;
+
+		var synchronization = currentBuild.Synchronization;
+		if (!synchronization.HasSnapshotChanges)
+		{
+			return new CliLibrarySynchronizationExecutionResult(
+				true,
+				false,
+				Array.Empty<string>(),
+				Array.Empty<string>(),
+				synchronization.MissingNodeIds.OrderBy(id => id.Value).Select(CliProjections.FormatId).ToArray(),
+				currentBuild.Document.Inspection.Diagnostics);
+		}
+
+		var persisted = await session.SaveNodesOnlyAsync(synchronization.Snapshot, cancellationToken).ConfigureAwait(false);
+		var cleanup = CoreServices.CreateModLibraryResidualCleanupService()
+			.Cleanup(persisted, workspace.LibraryRoot!, cancellationToken);
+		return new CliLibrarySynchronizationExecutionResult(
+			true,
+			true,
+			synchronization.AddedNodeIds.OrderBy(id => id.Value).Select(CliProjections.FormatId).ToArray(),
+			synchronization.ChangedNodeIds.OrderBy(id => id.Value).Select(CliProjections.FormatId).ToArray(),
+			synchronization.MissingNodeIds.OrderBy(id => id.Value).Select(CliProjections.FormatId).ToArray(),
+			currentBuild.Document.Inspection.Diagnostics);
+	}
+
 	public static async ValueTask<CliLibrarySynchronizationExecutionResult> ApplyAsync(
 		CliLibrarySynchronizationPlanDocument document,
 		CliWorkspace workspace,
+		bool fastMode = true,
 		CancellationToken cancellationToken = default)
 	{
 		var validation = await CliLibrarySynchronizationPlanArtifacts
-			.ValidateAsync(document, workspace, cancellationToken)
+			.ValidateAsync(document, workspace, fastMode: fastMode, cancellationToken)
 			.ConfigureAwait(false);
 		if (!validation.IsValid || validation.Current is null)
 			return Failure(validation.Diagnostics);
@@ -51,11 +114,10 @@ internal static class CliLibrarySynchronizationExecutor
 				return new CliLibrarySynchronizationExecutionResult(
 					true, false, Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), diagnostics);
 		}
-		// Repeat validation inside the cross-process lease before writing the
-		// library file; the plan never bypasses this second scan.
-		var locked = await CliLibrarySynchronizationPlanArtifacts
-			.ValidateAsync(document, workspace, cancellationToken)
-			.ConfigureAwait(false);
+		// 若基底目录发生了改名，必须重新扫描以感知新路径；否则安全复用已验证的构建快照。
+		var locked = migration.Renamed > 0
+			? await CliLibrarySynchronizationPlanArtifacts.ValidateAsync(document, workspace, fastMode: fastMode, cancellationToken).ConfigureAwait(false)
+			: validation;
 		if (!locked.IsValid || locked.Current is null)
 			return Failure(locked.Diagnostics);
 
